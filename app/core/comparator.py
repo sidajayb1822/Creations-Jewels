@@ -1,25 +1,40 @@
 """
 Compares a parsed BOMDocument against Emperor master data.
 
-Each ComparisonRow carries:
-  section, code, description, template_value, master_value, diff_$, diff_%
-  status: "match" | "minor" | "major" | "missing"
+Pricing is **formula-driven**: every line resolves a FormulaDef for its
+component (metal, diamond, colour_stone, finding, labour_q, labour_w, cdw) and
+customer via app.core.formula_store, then evaluates it against a per-line
+variable context built from the BOM line + DB lookups + settings.
 
-Metal comparison logic:
-  RmRt.RrSalRt is the rate factor (e.g. 0.585 for G14 = 58.5% purity factor).
-  master_rate_per_gram = RrSalRt * (BOM_LME_per_troy_oz / 31.1035)
-  master_value = master_rate_per_gram * weight_grams
+The built-in default formulas reproduce the previously hard-coded math exactly:
+  metal        (LME / 31.1035) × RmMst.RmPurityRt × (1 + loss%) × weight
+  diamond/CS   RmRt rate/ct × carat weight
+  labour_q     LabRt rate × qty        labour_w  LabRt rate × total metal wt
+  cdw          LabRt rate × total diamond wt      finding  LabRt rate (direct)
+
+Each ComparisonRow carries the resolved value AND a TraceStep breakdown so the
+UI can show (and let the user edit) exactly how the number was produced.
+
+A line is "missing" (no master value) when its required DB lookup does not
+resolve or its formula fails to evaluate — never a crash.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from app.models.bom import BOMDocument
-from app.core.db import DBConnection, TROY_OZ_TO_GRAM
+from app.core.db import DBConnection, DEFAULT_METAL_LOSS_PCT
+from app.core.formula import evaluate, FormulaError, TraceStep
+from app.core.formula_store import formula_store
+from app.core.custom_var import custom_var_store
 
 MINOR_THRESHOLD = 5.0    # yellow
 MAJOR_THRESHOLD = 15.0   # red
 MIN_COMPARE_VALUE = 1.0  # lines below this $ value are always "match" (avoids float noise on $0 items)
+
+# Labour heads charged per carat of diamond rather than per gram of metal.
+# Reference: "CDW = D weight x Lbr Rate".
+DIAMOND_WEIGHT_LABOUR_CODES = {"CDW"}
 
 
 @dataclass
@@ -32,6 +47,9 @@ class ComparisonRow:
     diff_dollar: float = 0.0
     diff_pct: float = 0.0
     status: str = "match"   # "match" | "minor" | "major" | "missing"
+    component: str = ""     # formula component key (metal, diamond, labour_q, …)
+    customer_code: str = ""  # company code the formula was resolved for
+    trace: list[TraceStep] = field(default_factory=list)
 
 
 def _pct(template: float, master: float) -> float:
@@ -59,6 +77,15 @@ def _stone_lookup_dim(s) -> float:
     return 0.0
 
 
+def _labour_component(main_code: str, lr_qw: str) -> str:
+    """Route a labour line to the formula component that matches its rate basis."""
+    if lr_qw == "W":
+        if main_code.strip().upper() in DIAMOND_WEIGHT_LABOUR_CODES:
+            return "cdw"
+        return "labour_w"
+    return "labour_q"
+
+
 def _classify(diff_pct: float, master_value: Optional[float],
               template_value: float = 0.0) -> str:
     if master_value is None:
@@ -73,162 +100,201 @@ def _classify(diff_pct: float, master_value: Optional[float],
     return "major"
 
 
+def _inject_custom_vars(ctx: dict, db: DBConnection, field_map: dict) -> None:
+    """
+    Resolve every enabled custom variable for this line and add it to ctx.
+    A variable is skipped for a line when one of its match sources isn't
+    available (e.g. a set_code lookup on a metal line) — so a formula that
+    references it there simply evaluates to "missing", never an error.
+    """
+    for cv in custom_var_store.list_all():
+        if not cv.enabled or not cv.table or not cv.value_column:
+            continue
+        conditions = []
+        ok = True
+        for mk in cv.match_keys:
+            if mk.source == "literal":
+                val: object = mk.literal
+                try:
+                    val = float(mk.literal)
+                except (TypeError, ValueError):
+                    pass
+            else:
+                if mk.source not in field_map:
+                    ok = False
+                    break
+                val = field_map[mk.source]
+                if val is None or val == "":
+                    ok = False
+                    break
+            conditions.append((mk.column, mk.op, val))
+        if not ok:
+            continue
+        value = db.resolve_custom_value(cv.table, cv.value_column,
+                                        cv.aggregate, conditions)
+        if value is not None:
+            ctx[cv.name] = value
+
+
+def _eval_component(component: str, company_code: str,
+                    ctx: dict) -> tuple[Optional[float], list[TraceStep]]:
+    """
+    Resolve and evaluate the formula for (component, company_code) against ctx.
+    Returns (rounded_value, trace), or (None, []) when the formula is disabled,
+    missing, or references a value not present in ctx (fail-safe → "missing").
+    """
+    fd = formula_store.get(component, company_code)
+    if fd is None or not fd.enabled or not fd.expression.strip():
+        return None, []
+    try:
+        value, trace = evaluate(fd.expression, ctx)
+    except FormulaError:
+        return None, []
+    return round(value, 2), trace
+
+
+def _row(section: str, code: str, description: str, template_val: float,
+         master_val: Optional[float], component: str, company_code: str,
+         trace: list[TraceStep]) -> ComparisonRow:
+    diff = round((master_val or 0.0) - template_val, 2)
+    pct = _pct(template_val, master_val or 0.0) if master_val is not None else 0.0
+    return ComparisonRow(
+        section=section,
+        code=code,
+        description=description,
+        template_value=template_val,
+        master_value=master_val,
+        diff_dollar=diff,
+        diff_pct=round(pct, 2),
+        status=_classify(pct, master_val, template_val),
+        component=component,
+        customer_code=company_code,
+        trace=trace,
+    )
+
+
 def compare(doc: BOMDocument, db: DBConnection,
-            company_code: str = "") -> list[ComparisonRow]:
+            company_code: str = "",
+            loss_pct: Optional[float] = None) -> list[ComparisonRow]:
+    """
+    Compare a parsed BOM against Emperor master data.
+
+    loss_pct: metal wastage uplift in percent. When None, Emperor's own value
+    for the customer is used, falling back to DEFAULT_METAL_LOSS_PCT.
+    """
     rows: list[ComparisonRow] = []
 
     if not db.is_connected():
         return rows
 
+    if loss_pct is None:
+        loss_pct = db.get_metal_loss_pct(company_code)
+        if loss_pct is None:
+            loss_pct = DEFAULT_METAL_LOSS_PCT
+
+    # Aggregates shared by every line's context.
+    metal_weight = sum(m.weight for m in doc.metals)
+    diamond_weight = sum(s.weight for s in doc.stones
+                         if s.description.strip().upper().startswith("D"))
+    colour_weight = sum(s.weight for s in doc.stones
+                        if s.description.strip().upper().startswith("C"))
+    base_ctx = {
+        "loss_pct": loss_pct,
+        "metal_weight": metal_weight,
+        "diamond_weight": diamond_weight,
+        "colour_weight": colour_weight,
+        "CmMulBy": db.get_customer_multiplier(company_code),
+    }
+    emperor_loss = db.get_metal_loss_pct(company_code)
+    if emperor_loss is not None:
+        base_ctx["LossMst_LmLossPer"] = emperor_loss
+
     # ---- Metals ----
-    # RmRt.RrSalRt = rate factor; master $/g = factor × (LME / TROY_OZ_TO_GRAM)
     rm_codes = list({m.rm_code for m in doc.metals if m.rm_code})
-    metal_factors = db.get_metal_rates(rm_codes, company_code)
+    metal_purity = db.get_metal_purity(rm_codes)
+    metal_factors = db.get_metal_rates(rm_codes, company_code)  # CRP fallback
+    crp_factors = db.get_crp_factor(rm_codes)
 
     stone_rm_codes = list({s.rm_code for s in doc.stones if s.rm_code})
-    all_rm_codes = list(set(rm_codes + stone_rm_codes))
-    rm_descriptions = db.get_rm_descriptions(all_rm_codes)
+    rm_descriptions = db.get_rm_descriptions(list(set(rm_codes + stone_rm_codes)))
 
     for m in doc.metals:
-        factor = metal_factors.get(m.rm_code)
-        master_val: Optional[float] = None
-        if factor is not None and m.lme_rate > 0 and m.weight > 0:
-            master_rate_per_gram = factor * (m.lme_rate / TROY_OZ_TO_GRAM)
-            master_val = round(master_rate_per_gram * m.weight, 2)
-        template_val = m.value
-        diff = round((master_val or 0.0) - template_val, 2)
-        pct = _pct(template_val, master_val or 0.0) if master_val is not None else 0.0
+        purity = metal_purity.get(m.rm_code, metal_factors.get(m.rm_code))
+        ctx = {**base_ctx, "lme": m.lme_rate, "weight": m.weight,
+               "qty": m.qty, "line_value": m.value}
+        if purity is not None:
+            ctx["RmMst_RmPurityRt"] = purity
+        crp = crp_factors.get(m.rm_code)
+        if crp is not None:
+            ctx["RmRt_CRP"] = crp
+        _inject_custom_vars(ctx, db, {"rm_code": m.rm_code, "customer": company_code,
+                                      "weight": m.weight, "qty": m.qty})
+        master_val, trace = _eval_component("metal", company_code, ctx)
         desc = rm_descriptions.get(m.rm_code) or f"{m.category} {m.sub_category}".strip()
-        rows.append(ComparisonRow(
-            section="Metal",
-            code=m.rm_code,
-            description=desc,
-            template_value=template_val,
-            master_value=master_val,
-            diff_dollar=diff,
-            diff_pct=round(pct, 2),
-            status=_classify(pct, master_val, template_val),
-        ))
+        rows.append(_row("Metal", m.rm_code, desc, m.value,
+                         master_val, "metal", company_code, trace))
 
-    # ---- Stones ----
-    # Large stones use pointer_value (carats); small melee use L2 from dimension string (mm).
+    # ---- Stones (diamond / colour) ----
     stone_lookups = list({(s.rm_code, _stone_lookup_dim(s))
                           for s in doc.stones if s.rm_code})
     stone_prices = db.get_stone_prices(stone_lookups, company_code)
 
     for s in doc.stones:
-        key = (s.rm_code, _stone_lookup_dim(s))
-        master_price = stone_prices.get(key)
-        template_val = s.value
-        master_val: Optional[float] = None
-        if master_price is not None and s.weight > 0:
-            master_val = round(master_price * s.weight, 2)
-        diff = round((master_val or 0.0) - template_val, 2)
-        pct = _pct(template_val, master_val or 0.0) if master_val is not None else 0.0
+        master_price = stone_prices.get((s.rm_code, _stone_lookup_dim(s)))
+        component = "colour_stone" if s.description.strip().upper().startswith("C") else "diamond"
+        dim = _stone_lookup_dim(s)
+        ctx = {**base_ctx, "weight": s.weight, "qty": s.qty,
+               "pointer": dim, "line_value": s.value,
+               "setting_rate": s.rate_each, "setting_qty": s.qty}
+        if master_price is not None:
+            ctx["RmRt_rate"] = master_price
+        _inject_custom_vars(ctx, db, {"rm_code": s.rm_code, "set_code": s.set_code,
+                                      "customer": company_code, "pointer": dim,
+                                      "weight": s.weight, "qty": s.qty})
+        master_val, trace = _eval_component(component, company_code, ctx)
         desc = rm_descriptions.get(s.rm_code) or f"{s.shape} {s.dimension}".strip()
-        rows.append(ComparisonRow(
-            section="Stone",
-            code=s.rm_code or s.set_code,
-            description=desc,
-            template_value=template_val,
-            master_value=master_val,
-            diff_dollar=diff,
-            diff_pct=round(pct, 2),
-            status=_classify(pct, master_val, template_val),
-        ))
+        rows.append(_row("Stone", s.rm_code or s.set_code, desc, s.value,
+                         master_val, component, company_code, trace))
 
-    # ---- Labour (Setting) ----
-    # LabRt: LrMCd=pointer, LrSCd=sub_code; LrSalRt = rate per piece (Q) or per gram (W)
-    metal_weight = sum(m.weight for m in doc.metals)
-    setting_pairs = list({(l.pointer, l.sub_code)
-                          for l in doc.labour_setting if l.pointer})
-    setting_rates = db.get_labour_rates(setting_pairs, company_code, weight=metal_weight)
-
-    for l in doc.labour_setting:
-        key = (l.pointer, l.sub_code)
-        rate_tuple = setting_rates.get(key)
-        template_val = l.value
-        master_val: Optional[float] = None
-        if rate_tuple is not None:
-            master_rate, lr_qw = rate_tuple
-            multiplier = metal_weight if lr_qw == "W" else l.qty
-            if multiplier > 0:
-                master_val = round(master_rate * multiplier, 2)
-        diff = round((master_val or 0.0) - template_val, 2)
-        pct = _pct(template_val, master_val or 0.0) if master_val is not None else 0.0
-        rows.append(ComparisonRow(
-            section="Labour (Setting)",
-            code=f"{l.pointer}/{l.sub_code}",
-            description=l.sub_code,
-            template_value=template_val,
-            master_value=master_val,
-            diff_dollar=diff,
-            diff_pct=round(pct, 2),
-            status=_classify(pct, master_val, template_val),
-        ))
-
-    # ---- Labour (Others) ----
-    other_pairs = list({(l.pointer, l.sub_code)
-                        for l in doc.labour_others if l.pointer})
-    other_rates = db.get_labour_rates(other_pairs, company_code, weight=metal_weight)
-
-    for l in doc.labour_others:
-        key = (l.pointer, l.sub_code)
-        rate_tuple = other_rates.get(key)
-        template_val = l.value
-        master_val: Optional[float] = None
-        if rate_tuple is not None:
-            master_rate, lr_qw = rate_tuple
-            multiplier = metal_weight if lr_qw == "W" else l.qty
-            if multiplier > 0:
-                master_val = round(master_rate * multiplier, 2)
-        diff = round((master_val or 0.0) - template_val, 2)
-        pct = _pct(template_val, master_val or 0.0) if master_val is not None else 0.0
-        rows.append(ComparisonRow(
-            section="Labour (Others)",
-            code=f"{l.pointer}/{l.sub_code}",
-            description=l.sub_code,
-            template_value=template_val,
-            master_value=master_val,
-            diff_dollar=diff,
-            diff_pct=round(pct, 2),
-            status=_classify(pct, master_val, template_val),
-        ))
-
-    # ---- Findings ----
-    finding_pairs = list({(f.pointer, f.sub_code)
-                          for f in doc.findings if f.pointer})
-    finding_rates = db.get_labour_rates(finding_pairs, company_code, weight=metal_weight)
-
-    for f in doc.findings:
-        key = (f.pointer, f.sub_code)
-        rate_tuple = finding_rates.get(key)
-        template_val = f.value
-        master_val: Optional[float] = None
-        if rate_tuple is not None:
-            master_rate, lr_qw = rate_tuple
-            multiplier = metal_weight if lr_qw == "W" else f.qty
-            if multiplier > 0:
-                master_val = round(master_rate * multiplier, 2)
-        diff = round((master_val or 0.0) - template_val, 2)
-        pct = _pct(template_val, master_val or 0.0) if master_val is not None else 0.0
-        rows.append(ComparisonRow(
-            section="Findings",
-            code=f"{f.pointer}/{f.sub_code}",
-            description=f.sub_code,
-            template_value=template_val,
-            master_value=master_val,
-            diff_dollar=diff,
-            diff_pct=round(pct, 2),
-            status=_classify(pct, master_val, template_val),
-        ))
+    # ---- Labour (setting / others) and Findings ----
+    for lines, section, is_finding in (
+        (doc.labour_setting, "Labour (Setting)", False),
+        (doc.labour_others, "Labour (Others)", False),
+        (doc.findings, "Findings", True),
+    ):
+        pairs = list({(l.pointer, l.sub_code) for l in lines if l.pointer})
+        rates = db.get_labour_rates(pairs, company_code, weight=metal_weight)
+        # Component used for display/edit when the rate (and thus Q/W) is unknown.
+        default_component = "finding" if is_finding else "labour_q"
+        for l in lines:
+            rate_tuple = rates.get((l.pointer, l.sub_code))
+            component = default_component
+            ctx = {**base_ctx, "qty": l.qty, "line_value": l.value}
+            if rate_tuple is not None:
+                master_rate, lr_qw = rate_tuple
+                component = "finding" if is_finding else _labour_component(l.pointer, lr_qw)
+                ctx["LabRt_rate"] = master_rate
+            _inject_custom_vars(ctx, db, {"main_code": l.pointer, "sub_code": l.sub_code,
+                                          "customer": company_code, "qty": l.qty})
+            master_val, trace = _eval_component(component, company_code, ctx)
+            rows.append(_row(section, f"{l.pointer}/{l.sub_code}", l.sub_code,
+                             l.value, master_val, component, company_code, trace))
 
     return rows
 
 
-def summary_stats(rows: list[ComparisonRow]) -> dict:
+def summary_stats(rows: list[ComparisonRow], multiplier: float = 1.0) -> dict:
+    """
+    Roll up the comparison.
+
+    multiplier: CustMst.CmMulBy — the additional-charge factor. Per the costing
+    reference it applies to the TOTAL calculated price, not to individual lines,
+    so it is applied here to the master total only. The template total already
+    has whatever the quotation charged baked in.
+    """
     total_template = sum(r.template_value for r in rows)
-    total_master = sum(r.master_value for r in rows if r.master_value is not None)
+    total_master_raw = sum(r.master_value for r in rows if r.master_value is not None)
+    total_master = round(total_master_raw * multiplier, 2)
     total_diff = round(total_master - total_template, 2)
     total_pct = round(_pct(total_template, total_master), 2) if total_template else 0.0
     counts: dict[str, int] = {"match": 0, "minor": 0, "major": 0, "missing": 0}
@@ -236,7 +302,9 @@ def summary_stats(rows: list[ComparisonRow]) -> dict:
         counts[r.status] = counts.get(r.status, 0) + 1
     return {
         "total_template": round(total_template, 2),
-        "total_master": round(total_master, 2),
+        "total_master_raw": round(total_master_raw, 2),
+        "multiplier": multiplier,
+        "total_master": total_master,
         "total_diff": total_diff,
         "total_pct": total_pct,
         "counts": counts,

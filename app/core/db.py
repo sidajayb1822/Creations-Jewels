@@ -11,8 +11,17 @@ Config stored at ~/.emr_reporter/config.json.
 """
 
 import json
+import re
+import threading
 from pathlib import Path
 from typing import Optional
+
+# SQL identifier whitelist for the generic custom-variable resolver: only
+# letters, digits and underscore may appear in a table/column name, and only
+# these comparison operators are allowed. Everything else is rejected before a
+# query is built, so user-defined lookups carry no injection surface.
+_IDENT_RE = re.compile(r"^[A-Za-z0-9_]+$")
+_SAFE_OPS = {"=", "<=", ">=", "<", ">"}
 
 try:
     import pyodbc
@@ -30,10 +39,18 @@ DEFAULT_CONFIG = {
     "username": "sa",
     "password": "",
     "timeout": 10,
+    "query_timeout": 30,  # seconds a single query may run before it aborts
     "company_code": "",   # Emperor customer company code, e.g. "OM-LGD"
+    "metal_loss_pct": 10.0,   # fallback when LossMst has no matching row
 }
 
 TROY_OZ_TO_GRAM = 31.1035
+
+# Wastage/handling uplift applied on top of the fine metal rate. Emperor stores
+# this in LossMst (keyed via CustMst.CmLkUpMetLs), but that table is empty in the
+# EmrDaily restore and CmLkUpMetLs is blank for most customers, so this default
+# stands in. 10% reproduces the CJE-QT-26-A-382 quotation to within 0.0003 $/g.
+DEFAULT_METAL_LOSS_PCT = 10.0
 
 
 def load_config() -> dict:
@@ -82,6 +99,11 @@ class DBConnection:
     def __init__(self):
         self._conn: Optional[object] = None
         self._config: dict = {}
+        # The whole app shares ONE pyodbc connection, which is not safe for
+        # concurrent cursors. Every query goes through this lock so overlapping
+        # tab loads can't trigger "Connection is busy with results for another
+        # command" or corrupt each other.
+        self._lock = threading.RLock()
 
     def connect(self, config: Optional[dict] = None) -> None:
         if not PYODBC_AVAILABLE:
@@ -89,7 +111,14 @@ class DBConnection:
         cfg = config or load_config()
         self._config = cfg
         conn_str = build_connection_string(cfg)
-        self._conn = pyodbc.connect(conn_str, autocommit=True)
+        conn = pyodbc.connect(conn_str, autocommit=True)
+        # Per-query timeout so a slow query aborts with an error instead of
+        # hanging a tab forever.
+        try:
+            conn.timeout = int(cfg.get("query_timeout", 30))
+        except Exception:
+            pass
+        self._conn = conn
 
     def test_connection(self, config: dict) -> tuple[bool, str]:
         if not PYODBC_AVAILABLE:
@@ -119,12 +148,16 @@ class DBConnection:
     def _execute(self, sql: str, params=()) -> list[dict]:
         if not self._conn:
             raise RuntimeError("Not connected to database.")
-        cursor = self._conn.cursor()
-        cursor.execute(sql, params)
-        if cursor.description is None:
-            return []
-        columns = [desc[0] for desc in cursor.description]
-        return [dict(zip(columns, row)) for row in cursor.fetchall()]
+        with self._lock:
+            cursor = self._conn.cursor()
+            try:
+                cursor.execute(sql, params)
+                if cursor.description is None:
+                    return []
+                columns = [desc[0] for desc in cursor.description]
+                return [dict(zip(columns, row)) for row in cursor.fetchall()]
+            finally:
+                cursor.close()
 
     # ------------------------------------------------------------------
     # Metal rates
@@ -177,6 +210,108 @@ class DBConnection:
                 pass
 
         return result
+
+    # ------------------------------------------------------------------
+    # Metal purity  (RmMst.RmPurityRt)
+    # This is the authoritative purity factor per the client's costing
+    # reference (CJ DB ref.xlsx) — G14 = 0.5833, i.e. 14/24. Prefer it over
+    # the RmRt 'CRP' factor (0.585), which does not reproduce the quotation.
+    # ------------------------------------------------------------------
+    def get_metal_purity(self, rm_codes: list[str]) -> dict[str, float]:
+        """Returns {rm_code: RmPurityRt}. Skips rows with no/zero purity."""
+        if not rm_codes:
+            return {}
+        placeholders = ",".join("?" * len(rm_codes))
+        result: dict[str, float] = {}
+        try:
+            rows = self._execute(
+                f"SELECT RmCd, RmPurityRt FROM RmMst WHERE RmCd IN ({placeholders})",
+                list(rm_codes),
+            )
+            for r in rows:
+                purity = float(r["RmPurityRt"] or 0)
+                if purity > 0:
+                    result[r["RmCd"]] = purity
+        except Exception:
+            pass
+        return result
+
+    def get_crp_factor(self, rm_codes: list[str]) -> dict[str, float]:
+        """
+        Returns {rm_code: CRP purity factor} — the RmRt row with RrTcTyp='CRP'
+        (e.g. G14 = 0.585). This is the universal fallback factor; exposed so it
+        can be referenced explicitly in a formula.
+        """
+        if not rm_codes:
+            return {}
+        placeholders = ",".join("?" * len(rm_codes))
+        result: dict[str, float] = {}
+        try:
+            rows = self._execute(
+                f"SELECT RrCd, RrSalRt FROM RmRt "
+                f"WHERE RrCd IN ({placeholders}) AND RrTcTyp = 'CRP'",
+                list(rm_codes),
+            )
+            for r in rows:
+                code = r["RrCd"]
+                if code not in result:
+                    result[code] = float(r["RrSalRt"] or 0)
+        except Exception:
+            pass
+        return result
+
+    # ------------------------------------------------------------------
+    # Metal loss %  (wastage uplift on the fine rate)
+    # ------------------------------------------------------------------
+    def get_metal_loss_pct(self, company_code: str) -> Optional[float]:
+        """
+        Returns the loss % for this customer, or None if Emperor has none
+        configured (caller then falls back to the configured default).
+
+        CustMst.CmLkUpMetLs names a loss group that should resolve into
+        LossMst.LmLossPer. LossMst is empty in the EmrDaily restore and
+        CmLkUpMetLs is blank for most customers, so the exact join column is
+        UNVERIFIED — confirm with the client before relying on this path.
+        """
+        if not company_code:
+            return None
+        try:
+            rows = self._execute(
+                "SELECT CmLkUpMetLs FROM CustMst WHERE CmCd = ?", (company_code,)
+            )
+            if not rows:
+                return None
+            group = (rows[0].get("CmLkUpMetLs") or "").strip()
+            if not group:
+                return None
+            loss = self._execute(
+                "SELECT TOP 1 LmLossPer FROM LossMst "
+                "WHERE LmCoCd = ? AND ISNULL(LmValidYn,'Y') <> 'N'",
+                (group,),
+            )
+            if loss and loss[0]["LmLossPer"] is not None:
+                return float(loss[0]["LmLossPer"])
+        except Exception:
+            pass
+        return None
+
+    # ------------------------------------------------------------------
+    # Customer multiplier  (CustMst.CmMulBy)
+    # Applied to the TOTAL calculated price, not to individual lines.
+    # ------------------------------------------------------------------
+    def get_customer_multiplier(self, company_code: str) -> float:
+        """Returns CmMulBy for the customer; 1.0 when absent or zero."""
+        if not company_code:
+            return 1.0
+        try:
+            rows = self._execute(
+                "SELECT CmMulBy FROM CustMst WHERE CmCd = ?", (company_code,)
+            )
+            if rows and rows[0]["CmMulBy"]:
+                return float(rows[0]["CmMulBy"])
+        except Exception:
+            pass
+        return 1.0
 
     # ------------------------------------------------------------------
     # Stone rates
@@ -370,7 +505,10 @@ class DBConnection:
             params.extend([f"%{customer_filter}%", f"%{customer_filter}%"])
 
         if not show_delivered:
-            conditions.append("CONVERT(date, o.OmDelDt) = '1980-01-01'")
+            # Undelivered orders carry the 1980-01-01 sentinel delivery date.
+            # Use a sargable range (no CONVERT on every row) so this can use an
+            # index instead of scanning + converting the whole table.
+            conditions.append("o.OmDelDt < '1980-01-02'")
 
         where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 
@@ -393,6 +531,45 @@ class DBConnection:
             return [dict(r) for r in rows]
         except Exception:
             return []
+
+    # ------------------------------------------------------------------
+    # Generic custom-variable resolver
+    # Powers user-defined variables (app.core.custom_var) against ANY table.
+    # Identifiers are strictly whitelisted (letters/digits/underscore only) and
+    # bracket-quoted; only values are parameterised — so a new master can be
+    # wired from the UI with no SQL-injection surface.
+    # ------------------------------------------------------------------
+    def resolve_custom_value(
+        self,
+        table: str,
+        value_column: str,
+        aggregate: str,
+        conditions: list[tuple[str, str, object]],
+    ) -> Optional[float]:
+        if not (_IDENT_RE.match(table or "") and _IDENT_RE.match(value_column or "")):
+            return None
+        agg = (aggregate or "TOP1").upper()
+        where_parts: list[str] = []
+        params: list = []
+        for col, op, val in conditions:
+            if not _IDENT_RE.match(col or "") or op not in _SAFE_OPS:
+                return None
+            where_parts.append(f"[{col}] {op} ?")
+            params.append(val)
+        where = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
+        if agg == "TOP1":
+            sql = f"SELECT TOP 1 [{value_column}] AS v FROM [{table}]{where}"
+        elif agg in ("MIN", "MAX", "SUM", "AVG"):
+            sql = f"SELECT {agg}([{value_column}]) AS v FROM [{table}]{where}"
+        else:
+            return None
+        try:
+            rows = self._execute(sql, params)
+            if rows and rows[0]["v"] is not None:
+                return float(rows[0]["v"])
+        except Exception:
+            pass
+        return None
 
     # ------------------------------------------------------------------
     # Schema discovery helpers

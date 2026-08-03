@@ -65,10 +65,20 @@ class ComparisonTable(QTableWidget):
                     item.setTextAlignment(
                         Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
                     )
+                # Stash the source row on col 0 so clicks survive sorting.
+                if c_idx == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, row)
                 self.setItem(r_idx, c_idx, item)
 
         self.setSortingEnabled(True)
         self.resizeRowsToContents()
+
+    def row_at(self, table_row: int) -> "ComparisonRow | None":
+        """Return the ComparisonRow shown at a visual row index (sort-safe)."""
+        item = self.item(table_row, 0)
+        if item is None:
+            return None
+        return item.data(Qt.ItemDataRole.UserRole)
 
     def clear_data(self):
         self.setRowCount(0)

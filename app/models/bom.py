@@ -95,5 +95,13 @@ class BOMDocument:
     labour_setting: list[LabourLine] = field(default_factory=list)
     labour_others: list[LabourLine] = field(default_factory=list)
     findings: list[FindingLine] = field(default_factory=list)
+    chain: list[MetalLine] = field(default_factory=list)  # Chain & Accessories section
     summary: BOMSummary = field(default_factory=BOMSummary)
     source_file: str = ""
+    sheet_name: str = ""   # worksheet title — used as the design/tab label
+
+    @property
+    def design_label(self) -> str:
+        """Best label for a per-design tab: design code, else sheet, else file."""
+        return (self.header.design_code or self.sheet_name
+                or self.source_file or "BOM").strip()

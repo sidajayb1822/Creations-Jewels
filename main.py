@@ -176,7 +176,24 @@ def main():
             color: #0f172a;
         }
         QComboBox:focus { border: 1.5px solid #6366f1; }
-        QComboBox::drop-down { border: none; width: 24px; }
+        QComboBox::drop-down {
+            subcontrol-origin: padding;
+            subcontrol-position: center right;
+            border: none;
+            width: 26px;
+        }
+        /* Down caret drawn with borders (no image asset needed) so every
+           combo clearly reads as a dropdown. */
+        QComboBox::down-arrow {
+            image: none;
+            width: 0;
+            height: 0;
+            border-left: 5px solid transparent;
+            border-right: 5px solid transparent;
+            border-top: 6px solid #64748b;
+            margin-right: 10px;
+        }
+        QComboBox::down-arrow:hover { border-top-color: #4f46e5; }
         QComboBox QAbstractItemView {
             background: #ffffff;
             border: 1px solid #e2e8f0;

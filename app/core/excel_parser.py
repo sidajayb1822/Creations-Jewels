@@ -217,6 +217,43 @@ def _parse_labour(ws: Worksheet, keyword: str, section_label: str) -> list[Labou
 
 
 # ---------------------------------------------------------------------------
+# Chain & Accessories — col: 1=Sr 2=Ctg 3=SubCtg 4=RmCode 5=Qty 6=Wt 7=QW 8=Rate 9=Val
+# Same shape as metals minus the LME column. Present in DETAIL ORDER PRINTING
+# sheets; usually zero-valued. Parsed for completeness so totals reconcile.
+# ---------------------------------------------------------------------------
+
+def _parse_chain(ws: Worksheet) -> list[MetalLine]:
+    section_row = _find_section_row(ws, "CHAIN AND ACCESS")
+    if section_row is None:
+        return []
+    lines = []
+    data_start = section_row + 2
+    for r in range(data_start, data_start + 20):
+        sr_val = _val(ws.cell(row=r, column=1))
+        if sr_val is None or str(sr_val).strip() in ("", "Sr"):
+            continue
+        try:
+            sr = int(sr_val)
+        except (TypeError, ValueError):
+            break
+        line = MetalLine(
+            sr=sr,
+            category=_str(ws.cell(row=r, column=2)),
+            sub_category=_str(ws.cell(row=r, column=3)),
+            rm_code=_str(ws.cell(row=r, column=4)),
+            qty=_float(ws.cell(row=r, column=5)),
+            weight=_float(ws.cell(row=r, column=6)),
+            calc_mode=_str(ws.cell(row=r, column=7)) or "W",
+            lme_rate=0.0,   # chain rows carry no LME
+            rate=_float(ws.cell(row=r, column=8)),
+            value=_float(ws.cell(row=r, column=9)),
+        )
+        if line.rm_code:
+            lines.append(line)
+    return lines
+
+
+# ---------------------------------------------------------------------------
 # Findings — not a separate section in all templates; omitted when absent
 # ---------------------------------------------------------------------------
 
@@ -300,17 +337,15 @@ def _float_or_zero(stone) -> float:
 # Public API
 # ---------------------------------------------------------------------------
 
-def parse_bom(file_path: str) -> BOMDocument:
-    """Parse an Emperor BOM Excel file and return a BOMDocument."""
-    wb = openpyxl.load_workbook(file_path, data_only=True)
-    ws = wb.active
-
+def parse_worksheet(ws: Worksheet, source_file: str = "") -> BOMDocument:
+    """Parse a single Emperor BOM worksheet into a BOMDocument."""
     header = _parse_header(ws)
     metals = _parse_metals(ws)
     stones = _parse_stones(ws)
     labour_setting = _parse_labour(ws, "LABOR (EXCEPT", "setting")
     labour_others = _parse_labour(ws, "LABOR(OTHERS)", "others")
     findings = _parse_findings(ws)
+    chain = _parse_chain(ws)
     summary = _parse_summary(ws, metals, stones, labour_setting, labour_others, findings)
 
     return BOMDocument(
@@ -320,6 +355,35 @@ def parse_bom(file_path: str) -> BOMDocument:
         labour_setting=labour_setting,
         labour_others=labour_others,
         findings=findings,
+        chain=chain,
         summary=summary,
-        source_file=os.path.basename(file_path),
+        source_file=source_file,
+        sheet_name=ws.title,
     )
+
+
+def _is_design_sheet(ws: Worksheet) -> bool:
+    """A design BOM sheet has a METAL section; order-summary sheets do not."""
+    return _find_section_row(ws, "METAL") is not None
+
+
+def parse_bom(file_path: str) -> BOMDocument:
+    """Parse the active sheet of an Emperor BOM file (single-BOM back-compat)."""
+    wb = openpyxl.load_workbook(file_path, data_only=True)
+    return parse_worksheet(wb.active, os.path.basename(file_path))
+
+
+def parse_workbook(file_path: str) -> list[BOMDocument]:
+    """
+    Parse every design BOM in a workbook. A Sales-Order file has a leading
+    order-summary sheet (no METAL section) plus one sheet per design; the
+    summary is skipped. A single-BOM file yields a one-element list.
+    """
+    wb = openpyxl.load_workbook(file_path, data_only=True)
+    base = os.path.basename(file_path)
+    docs = [parse_worksheet(ws, base) for ws in wb.worksheets if _is_design_sheet(ws)]
+    if not docs:
+        # No sheet has a METAL header — fall back to the active sheet so the
+        # user still sees something rather than an empty result.
+        docs = [parse_worksheet(wb.active, base)]
+    return docs

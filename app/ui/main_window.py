@@ -5,6 +5,7 @@ from PySide6.QtWidgets import (
 from app.ui.bom_compare.widget import BOMCompareWidget
 from app.ui.customer_rates.widget import CustomerRatesWidget
 from app.ui.order_pipeline.widget import OrderPipelineWidget
+from app.ui.formulas.widget import FormulasWidget
 from app.ui.settings_dialog import SettingsDialog
 from app.core.db import db, load_config
 
@@ -13,8 +14,9 @@ _NAV_ITEMS = [
     ("📋", "BOM Comparison", 0),
     ("💰", "Customer Rates", 1),
     ("📦", "Order Pipeline", 2),
+    ("🧮", "Formulas", 3),
 ]
-_PAGE_TITLES = ["BOM Comparison", "Customer Rate Card", "Order Pipeline"]
+_PAGE_TITLES = ["BOM Comparison", "Customer Rate Card", "Order Pipeline", "Pricing Formulas"]
 
 
 class MainWindow(QMainWindow):
@@ -123,6 +125,8 @@ class MainWindow(QMainWindow):
         self._stack.addWidget(self.rates_tab)
         self.pipeline_tab = OrderPipelineWidget()
         self._stack.addWidget(self.pipeline_tab)
+        self.formulas_tab = FormulasWidget()
+        self._stack.addWidget(self.formulas_tab)
         cv.addWidget(self._stack, 1)
 
         h.addWidget(content, 1)

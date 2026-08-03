@@ -1,11 +1,13 @@
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLineEdit, QComboBox, QPushButton, QLabel,
-    QDialogButtonBox, QGroupBox, QSpinBox, QInputDialog,
+    QDialogButtonBox, QGroupBox, QSpinBox, QDoubleSpinBox, QInputDialog,
 )
 from PySide6.QtCore import Qt
 
-from app.core.db import load_config, save_config, db, build_connection_string
+from app.core.db import (
+    load_config, save_config, db, build_connection_string, DEFAULT_METAL_LOSS_PCT,
+)
 
 
 class SettingsDialog(QDialog):
@@ -62,6 +64,34 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(group)
 
+        # ---- Costing settings ----
+        costing = QGroupBox("Costing")
+        cform = QFormLayout(costing)
+        cform.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        cform.setSpacing(8)
+
+        self.company_edit = QLineEdit()
+        self.company_edit.setPlaceholderText("e.g.  OM-LGD   (blank = detect from BOM customer)")
+        cform.addRow("Company code:", self.company_edit)
+
+        self.loss_spin = QDoubleSpinBox()
+        self.loss_spin.setRange(0.0, 100.0)
+        self.loss_spin.setDecimals(2)
+        self.loss_spin.setSingleStep(0.5)
+        self.loss_spin.setValue(DEFAULT_METAL_LOSS_PCT)
+        self.loss_spin.setSuffix(" %")
+        cform.addRow("Metal loss %:", self.loss_spin)
+
+        loss_hint = QLabel(
+            "Wastage uplift on the fine metal rate. Emperor's own value "
+            "(CustMst → LossMst) is used when present; this is the fallback."
+        )
+        loss_hint.setWordWrap(True)
+        loss_hint.setStyleSheet("color: #64748b; font-size: 11px;")
+        cform.addRow("", loss_hint)
+
+        layout.addWidget(costing)
+
         # Test connection row
         test_row = QHBoxLayout()
         self.test_btn = QPushButton("Test Connection")
@@ -94,6 +124,8 @@ class SettingsDialog(QDialog):
         self.user_edit.setText(cfg.get("username", "sa"))
         self.pass_edit.setText(cfg.get("password", ""))
         self.timeout_spin.setValue(cfg.get("timeout", 10))
+        self.company_edit.setText(cfg.get("company_code", ""))
+        self.loss_spin.setValue(float(cfg.get("metal_loss_pct", DEFAULT_METAL_LOSS_PCT)))
         self._on_auth_changed(self.auth_combo.currentIndex())
 
     def _build_config(self) -> dict:
@@ -105,6 +137,8 @@ class SettingsDialog(QDialog):
             "username": self.user_edit.text().strip(),
             "password": self.pass_edit.text(),
             "timeout": self.timeout_spin.value(),
+            "company_code": self.company_edit.text().strip(),
+            "metal_loss_pct": self.loss_spin.value(),
         }
 
     def _browse_databases(self):
