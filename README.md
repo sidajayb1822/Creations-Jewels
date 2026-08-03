@@ -28,9 +28,10 @@ cd "Creations-Jewels/dist"
 
 | Tab | What it does |
 |-----|-------------|
-| **BOM Comparison** | Drop an Emperor quotation `.xlsx` — compares every metal, stone, and labour line against your master rates and highlights discrepancies in green / amber / red |
+| **BOM Comparison** | Drop an Emperor quotation or sales-order `.xlsx` — compares every metal, stone, and labour line against your master rates and highlights discrepancies in green / amber / red. **Multi-design files** (a sales order with several designs) show **one sub-tab per design**. **Double-click any line** to see exactly how its master value was calculated and edit the formula. **Export** writes every design into one Excel workbook (a sheet per design). |
 | **Customer Rate Card** | Browse all material and labour rates on file for any customer in the Emperor database |
 | **Order Pipeline** | Live view of open sales orders and quotations with delivery status (Open / Overdue / Delivered) |
+| **Formulas** | View and edit the pricing formulas the comparison uses — per component, with per-customer overrides. Two editors (guided step builder + editable expression). Define **custom variables** that read any Emperor table, so new masters can be priced without a code change. See [Pricing Formulas](#pricing-formulas). |
 
 ---
 
@@ -85,11 +86,13 @@ Common Emperor server addresses:
 | **Username** | SQL Server login — ask your Emperor admin for a read-only account |
 | **Password** | SQL Server login password |
 | **Timeout** | 10 seconds is fine for local networks; raise to 30 for VPN |
+| **Company code** | *(optional)* Emperor customer code for rate lookups, e.g. `OM-LGD`. Leave blank to auto-detect from the BOM's customer name |
+| **Metal loss %** | Wastage uplift on the fine metal rate (default 10%). Used as a fallback when Emperor has no loss value configured for the customer |
 
 4. Click **Test Connection** — you should see a green success message
 5. Click **OK** to save
 
-Settings are stored at `%USERPROFILE%\.emr_reporter\config.json` (never committed to git — each machine has its own).
+Settings are stored at `%USERPROFILE%\.emr_reporter\config.json` (never committed to git — each machine has its own). Pricing formulas live alongside it in `formulas.json` and `custom_variables.json`, seeded automatically on first run.
 
 ---
 
@@ -99,6 +102,43 @@ Settings are stored at `%USERPROFILE%\.emr_reporter\config.json` (never committe
 - Switch to **Customer Rate Card**, pick a customer, click **Load Rate Card** — rates should populate
 - Switch to **Order Pipeline** — open orders should load automatically
 - On **BOM Comparison**, drop a `.xlsx` Emperor quotation file — comparison table should fill in
+
+---
+
+## Pricing Formulas
+
+The master value for every line comes from an **editable formula**, not hard-coded logic. You can see and change them in the **Formulas** tab — no coding, and the Emperor database is never modified (all formulas are stored locally).
+
+### How a line is priced
+
+Each line resolves the formula for its **component**, with an optional **per-customer override**:
+
+| Component | Default formula |
+|-----------|-----------------|
+| Metal | `(lme / 31.1035) × RmMst.RmPurityRt × (1 + loss% / 100) × weight` |
+| Diamond / Colour stone | `RmRt rate per carat × carat weight` |
+| Labour (per piece) | `LabRt rate × qty` |
+| Labour (per gram) | `LabRt rate × total metal weight` |
+| CDW | `LabRt rate × total diamond weight` |
+| Finding | `LabRt rate` (direct) |
+
+The customer multiplier (`CustMst.CmMulBy`) is applied to the grand total.
+
+### Viewing & editing
+
+- **Double-click any comparison line** → see the step-by-step calculation (which table/column each value came from) and an **Edit formula** button.
+- The editor has two interchangeable views over one formula:
+  - **Guided builder** — pick a variable from a dropdown (grouped by BOM line / totals / database tables / settings / constants) or type a number, choose an operator, add/remove steps.
+  - **Editable expression** — the raw formula text with a Validate button and a variable legend. Supports `+ - * / **` and `min`, `max`, `round`, `abs` (e.g. `max(metal_weight * LabRt_rate, 2.0)` for a minimum charge).
+- Save as the **default** (all customers) or as a **per-customer override**.
+
+### Custom variables (use any table)
+
+If Emperor adds a new master/table, you don't need a new build. In the Formulas tab → **New variable**, pick a **table + value column + match keys** from dropdowns (populated live from the database), give it a name, and it becomes selectable in every formula. Table/column names are strictly validated, so these lookups are injection-safe.
+
+### Where formulas are stored
+
+Locally in `%USERPROFILE%\.emr_reporter\` — `formulas.json` and `custom_variables.json`. Built-in defaults are seeded on first run and reproduce Emperor's standard costing. **Nothing is written to the Emperor SQL Server.**
 
 ---
 
@@ -171,11 +211,14 @@ EMR Reporter queries these tables — all are standard Emperor tables, no custom
 
 | Table | Used for |
 |-------|----------|
-| `RmMst` | Raw material / stone descriptions |
-| `RmRt` | Material and stone rate lookup |
+| `RmMst` | Raw material / stone descriptions **and metal purity** (`RmPurityRt`) |
+| `RmRt` | Material and stone rate lookup (incl. `CRP` purity factor) |
 | `LabRt` | Labour rate lookup |
-| `CustMst` | Customer list and company codes |
+| `CustMst` | Customer list, company codes, multiplier (`CmMulBy`), loss lookup |
+| `LossMst` | Metal loss % (when configured per customer) |
 | `OrdMst` | Order pipeline |
+
+Custom variables (Formulas tab) may read **any** additional table you point them at — read-only.
 
 ---
 
@@ -223,17 +266,21 @@ emr-reporter/
 ├── dist/
 │   └── EMR Reporter.exe             # Distributable (Windows x64)
 └── app/
-    ├── models/bom.py                # BOM data model
+    ├── models/bom.py                # BOM data model (multi-design aware)
     ├── core/
-    │   ├── excel_parser.py          # Parses Emperor .xlsx quotations
-    │   ├── db.py                    # SQL Server connection + queries
-    │   └── comparator.py           # BOM vs master rate comparison logic
+    │   ├── excel_parser.py          # Parses Emperor .xlsx (single + multi-design workbooks)
+    │   ├── db.py                    # SQL Server connection + queries (locked, timeout-bounded)
+    │   ├── comparator.py            # Formula-driven BOM vs master comparison
+    │   ├── formula.py               # Formula model + safe evaluator + trace
+    │   ├── formula_store.py         # Local formula storage (seeded defaults, CRUD)
+    │   └── custom_var.py            # User-defined DB-lookup variables
     └── ui/
         ├── main_window.py           # Main window with sidebar navigation
-        ├── settings_dialog.py       # DB connection settings dialog
-        ├── bom_compare/             # BOM Comparison tab
+        ├── settings_dialog.py       # DB connection + costing settings
+        ├── bom_compare/             # BOM Comparison tab (per-design sub-tabs, line detail)
         ├── customer_rates/          # Customer Rate Card tab
-        └── order_pipeline/          # Order Pipeline tab
+        ├── order_pipeline/          # Order Pipeline tab
+        └── formulas/                # Formulas tab: CRUD + dual editor + custom-variable dialog
 ```
 
 ---
