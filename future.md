@@ -41,3 +41,49 @@ red "mismatch" even though nothing is wrong. This produces false discrepancies.
 
 **Reference tables:** `OrdLab` (order labour actually charged), `DsgLab` (design operations,
 no rate), `LabRt` (static customer rate chart), `MultiPrcQtLab` / `xTxnLab` (quote/txn labour).
+
+---
+
+## 2. One customer name → two Emperor accounts (regular vs lab-grown)
+
+**Status:** investigated, undecided — parked deliberately.
+
+**What it is**
+A single BOM customer name can map to **two (or more) real Emperor customer codes** with
+different rate charts. "OM JEWELRY INC" has:
+- `OMJEWLRY` — the regular account
+- `OM-LGD` — "OM JEWELRY INC (LGD)", the **lab-grown-diamond** account
+
+The exact-name auto-match (`find_company_code` in `app/core/db.py`) now resolves the file to
+`OMJEWLRY`. That fixed the engraving labour line but **regressed the stone lines**, because
+this order's stones are lab-grown and their rates match the **OM-LGD** chart, not OMJEWLRY.
+
+**Evidence (order `CJE\QT\26\A\382`, from `OrdRm` / `OrdLab`)**
+
+| Line | Quote (Emperor) | OM-LGD chart | OMJEWLRY chart |
+|------|-----------------|--------------|----------------|
+| TAP-LABVS @3.1mm | 125/ct → 96.75 | **125 ✅** | 115 → 89.01 ✗ |
+| OV-LABVS | 0.001 → ~0 | **0.001 ✅** | missing (N/A) |
+| ENGRV/ENGRNG | 1.00 | missing (N/A) | **1.00 ✅** |
+
+So **no single account reproduces the whole quote** — stones line up with OM-LGD, engraving
+labour with OMJEWLRY. Likely the quote was built from the design's **frozen costing**, which
+matches OM-LGD's older stone rates while OMJEWLRY's have since drifted (115).
+
+**Why it matters**
+Auto-detecting by name alone can pick the "wrong" sibling account and flip several lines
+between match and mismatch/N/A. Which account is authoritative depends on the order type
+(lab-grown vs natural), which the name doesn't state.
+
+**Possible future handling (not decided)**
+- Let the user map a customer name → a specific company code (a saved alias table), and/or a
+  rule like "lab-grown BOM → the -LGD account".
+- Or make auto-detect prefer the sibling account whose chart best **covers the BOM's actual
+  items** (most lines resolved), instead of just the exact name.
+- Or detect lab-grown content in the BOM (stone codes like `*-LAB*`, `*LBG*`) and prefer the
+  matching LGD account.
+- Interim workaround (already possible, no code change): set **Company code** manually in
+  Settings per file (e.g. `OM-LGD` for a lab-grown OM order).
+
+**Reference:** `find_company_code` (`app/core/db.py`), `CustMst` (`CmCd`, `CmName`,
+`CmLkUpRmRt`, `CmLkUpLabRt`), `OrdRm` / `OrdLab` (what the quote actually used).

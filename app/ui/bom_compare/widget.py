@@ -2,10 +2,10 @@ import os
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QFileDialog, QMessageBox,
-    QGroupBox, QGridLayout, QTabWidget,
+    QGroupBox, QGridLayout, QTabWidget, QLineEdit,
 )
 from PySide6.QtCore import Qt, QThread, Signal, QObject
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QColor
 
 from app.ui.bom_compare.drop_zone import DropZone
 from app.ui.bom_compare.comparison_table import ComparisonTable
@@ -169,6 +169,14 @@ class BOMCompareWidget(QWidget):
         self.order_label.setStyleSheet("color: #64748b; font-style: italic;")
         layout.addWidget(self.order_label)
 
+        # Filter the design tabs by name (shown only for multi-design files).
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Search designs…")
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.textChanged.connect(self._filter_tabs)
+        self.search_edit.hide()
+        layout.addWidget(self.search_edit)
+
         # One sub-tab per design.
         self.tabs = QTabWidget()
         self.tabs.setObjectName("designTabs")
@@ -206,13 +214,55 @@ class BOMCompareWidget(QWidget):
         self._thread.start()
 
     def _on_done(self, results: list, order_info: str):
-        self.order_label.setText(order_info)
         self.tabs.clear()
+        diff_designs = 0
         for res in results:
             panel = _DesignComparePanel(on_edit_formula=self._reload)
             panel.load(res["rows"], res["stats"])
-            self.tabs.addTab(panel, res["label"])
+            idx = self.tabs.addTab(panel, res["label"])
+
+            # Highlight tabs whose comparison has a real price difference.
+            c = res["stats"].get("counts", {})
+            major, minor, missing = (c.get("major", 0), c.get("minor", 0),
+                                     c.get("missing", 0))
+            if major:
+                self.tabs.tabBar().setTabTextColor(idx, QColor("#dc2626"))
+            elif minor:
+                self.tabs.tabBar().setTabTextColor(idx, QColor("#d97706"))
+            if major or minor:
+                diff_designs += 1
+            parts = []
+            if major:
+                parts.append(f"{major} over threshold")
+            if minor:
+                parts.append(f"{minor} minor")
+            if missing:
+                parts.append(f"{missing} missing")
+            self.tabs.setTabToolTip(idx, ", ".join(parts) if parts else "all match")
+
+        if diff_designs:
+            order_info += f"  |  {diff_designs} design(s) with differences"
+        self.order_label.setText(order_info)
+
+        # Search bar only helps when there's more than one design.
+        self.search_edit.blockSignals(True)
+        self.search_edit.clear()
+        self.search_edit.blockSignals(False)
+        self.search_edit.setVisible(len(results) > 1)
         self.export_btn.setEnabled(bool(results))
+
+    def _filter_tabs(self, text: str):
+        """Show only design tabs whose name contains the search text."""
+        q = (text or "").strip().lower()
+        first_visible = -1
+        for i in range(self.tabs.count()):
+            visible = q in self.tabs.tabText(i).lower()
+            self.tabs.setTabVisible(i, visible)
+            if visible and first_visible < 0:
+                first_visible = i
+        cur = self.tabs.currentIndex()
+        if cur >= 0 and not self.tabs.isTabVisible(cur) and first_visible >= 0:
+            self.tabs.setCurrentIndex(first_visible)
 
     def _on_error(self, msg: str):
         self.order_label.setText("Error loading file")
