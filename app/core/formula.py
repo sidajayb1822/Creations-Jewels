@@ -84,6 +84,7 @@ VARIABLES: dict[str, VarInfo] = {
     "RmRt_CRP":         VarInfo("CRP purity factor", "db", "RmRt.RrSalRt (TcTyp='CRP')"),
     "RmRt_rate":        VarInfo("Stone rate / carat", "db", "RmRt.RrSalRt (range match)"),
     "LabRt_rate":       VarInfo("Labour rate", "db", "LabRt.LrSalRt"),
+    "LabRt_min":        VarInfo("Labour minimum charge", "db", "LabRt.LrSalMin"),
     "CmMulBy":          VarInfo("Customer multiplier", "db", "CustMst.CmMulBy"),
     "LossMst_LmLossPer": VarInfo("Loss % (Emperor)", "db", "LossMst.LmLossPer"),
     # --- settings ---
@@ -106,7 +107,8 @@ def sample_context() -> dict[str, float]:
         "setting_rate": 0.40, "setting_qty": 2.0,
         "metal_weight": 4.7, "diamond_weight": 0.774, "colour_weight": 0.0,
         "RmMst_RmPurityRt": 0.5833, "RmRt_CRP": 0.585, "RmRt_rate": 125.0,
-        "LabRt_rate": 75.0, "CmMulBy": 1.0, "LossMst_LmLossPer": 10.0, "loss_pct": 10.0,
+        "LabRt_rate": 75.0, "LabRt_min": 0.0,
+        "CmMulBy": 1.0, "LossMst_LmLossPer": 10.0, "loss_pct": 10.0,
     }
 
 # Functions the evaluator permits.

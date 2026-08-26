@@ -42,7 +42,7 @@ OPERAND_GROUPS: list[tuple[str, list[str]]] = [
                   "setting_rate", "setting_qty"]),
     ("Totals", ["metal_weight", "diamond_weight", "colour_weight"]),
     ("Database tables", ["RmMst_RmPurityRt", "RmRt_CRP", "RmRt_rate", "LabRt_rate",
-                         "CmMulBy", "LossMst_LmLossPer"]),
+                         "LabRt_min", "CmMulBy", "LossMst_LmLossPer"]),
     ("Setting", ["loss_pct"]),
     ("Constant", ["TROY_OZ"]),
 ]

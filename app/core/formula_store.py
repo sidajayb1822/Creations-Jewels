@@ -58,19 +58,28 @@ SEED_DEFAULTS: dict[str, FormulaDef] = {
     ),
     "labour_q": FormulaDef(
         component="labour_q",
-        expression="LabRt_rate * qty",
-        notes="Per-piece labour = rate × quantity (LrQw='Q').",
+        expression="max(LabRt_rate * qty, LabRt_min)",
+        notes="Per-piece labour = rate × quantity (LrQw='Q'), floored at the minimum charge.",
     ),
     "labour_w": FormulaDef(
         component="labour_w",
-        expression="LabRt_rate * metal_weight",
-        notes="Per-gram labour = rate × total metal weight (LrQw='W').",
+        expression="max(LabRt_rate * metal_weight, LabRt_min)",
+        notes="Per-gram labour = rate × total metal weight (LrQw='W'), floored at the minimum charge.",
     ),
     "cdw": FormulaDef(
         component="cdw",
-        expression="LabRt_rate * diamond_weight",
-        notes="Diamond-weight labour (CDW) = rate × total diamond carats.",
+        expression="max(LabRt_rate * diamond_weight, LabRt_min)",
+        notes="Diamond-weight labour (CDW) = rate × total diamond carats, floored at the minimum charge.",
     ),
+}
+
+# Old labour seed expressions (pre-minimum). Untouched defaults matching these
+# are upgraded in place on load so existing installs pick up the minimum charge
+# without clobbering any formula the user has customised.
+_LABOUR_UPGRADES = {
+    "labour_q": ("LabRt_rate * qty", "max(LabRt_rate * qty, LabRt_min)"),
+    "labour_w": ("LabRt_rate * metal_weight", "max(LabRt_rate * metal_weight, LabRt_min)"),
+    "cdw": ("LabRt_rate * diamond_weight", "max(LabRt_rate * diamond_weight, LabRt_min)"),
 }
 
 
@@ -97,11 +106,18 @@ class FormulaStore:
         self._ensure_seeds()
 
     def _ensure_seeds(self) -> None:
-        """Add any missing built-in default; persist if we had to add one."""
+        """Add any missing built-in default and migrate untouched labour defaults;
+        persist if anything changed."""
         changed = False
         for comp, seed in SEED_DEFAULTS.items():
             if (comp, "") not in self._defs:
                 self._defs[(comp, "")] = FormulaDef.from_dict(seed.to_dict())
+                changed = True
+        # Upgrade pre-minimum labour defaults that the user hasn't edited.
+        for comp, (old_expr, new_expr) in _LABOUR_UPGRADES.items():
+            fd = self._defs.get((comp, ""))
+            if fd and fd.expression.strip() == old_expr:
+                fd.expression = new_expr
                 changed = True
         if changed:
             self.save()

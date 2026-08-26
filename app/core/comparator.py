@@ -50,6 +50,7 @@ class ComparisonRow:
     component: str = ""     # formula component key (metal, diamond, labour_q, …)
     customer_code: str = ""  # company code the formula was resolved for
     trace: list[TraceStep] = field(default_factory=list)
+    source_note: str = ""    # e.g. "base chart" when the rate came from the fallback chart
 
 
 def _pct(template: float, master: float) -> float:
@@ -75,6 +76,26 @@ def _stone_lookup_dim(s) -> float:
         except (ValueError, IndexError):
             pass
     return 0.0
+
+
+def _stone_candidates(s) -> tuple:
+    """
+    Ordered, hashable set of candidate lookup dimensions for a stone's rate
+    lookup: (pointer_carats, L1, L2, L3). The DB matcher tries the carat pointer
+    first (correct for large solitaires, whose bands are in carats) and otherwise
+    the largest millimetre dimension that lands in a band (correct for melee /
+    baguettes, whose bands are in mm even when the stone also carries a tiny carat
+    value). Zeros are placeholders and are ignored by the matcher.
+    """
+    pointer = round(s.pointer_value, 4) if s.pointer_value and s.pointer_value > 0 else 0.0
+    dims = []
+    for part in s.dimension.replace(" ", "").split("*"):
+        try:
+            dims.append(round(float(part), 4))
+        except (ValueError, IndexError):
+            dims.append(0.0)
+    dims = (dims + [0.0, 0.0, 0.0])[:3]   # pad to L1, L2, L3
+    return (pointer, dims[0], dims[1], dims[2])
 
 
 def _labour_component(main_code: str, lr_qw: str) -> str:
@@ -155,7 +176,7 @@ def _eval_component(component: str, company_code: str,
 
 def _row(section: str, code: str, description: str, template_val: float,
          master_val: Optional[float], component: str, company_code: str,
-         trace: list[TraceStep]) -> ComparisonRow:
+         trace: list[TraceStep], source_note: str = "") -> ComparisonRow:
     diff = round((master_val or 0.0) - template_val, 2)
     pct = _pct(template_val, master_val or 0.0) if master_val is not None else 0.0
     return ComparisonRow(
@@ -170,22 +191,57 @@ def _row(section: str, code: str, description: str, template_val: float,
         component=component,
         customer_code=company_code,
         trace=trace,
+        source_note=source_note,
     )
+
+
+def _fill_from_base(primary: dict, lookup_fn, keys: list,
+                    base_company_code: str) -> tuple[dict, set]:
+    """
+    For every key not resolved in `primary`, look it up under the base chart via
+    lookup_fn(missing_keys, base_company_code) and merge the results in. Returns
+    (merged_dict, base_sourced_keys). No-op (empty base set) when there is no
+    base code or nothing is missing.
+    """
+    if not base_company_code:
+        return primary, set()
+    missing = [k for k in keys if k not in primary]
+    if not missing:
+        return primary, set()
+    base_hits = lookup_fn(missing, base_company_code)
+    merged = dict(primary)
+    base_keys = set()
+    for k, v in base_hits.items():
+        if k not in merged:
+            merged[k] = v
+            base_keys.add(k)
+    return merged, base_keys
 
 
 def compare(doc: BOMDocument, db: DBConnection,
             company_code: str = "",
-            loss_pct: Optional[float] = None) -> list[ComparisonRow]:
+            loss_pct: Optional[float] = None,
+            base_company_code: str = "") -> list[ComparisonRow]:
     """
     Compare a parsed BOM against Emperor master data.
 
     loss_pct: metal wastage uplift in percent. When None, Emperor's own value
     for the customer is used, falling back to DEFAULT_METAL_LOSS_PCT.
+
+    base_company_code: a fallback rate chart (e.g. "ZSELF"). Any line whose rate
+    is missing for `company_code` is filled from this chart instead of showing
+    N/A, and flagged with source_note="base chart". Ignored when blank or equal
+    to company_code. Never overrides a rate the customer's own chart provides.
     """
     rows: list[ComparisonRow] = []
 
     if not db.is_connected():
         return rows
+
+    # Guard: no self-fallback, and treat blank as disabled.
+    base_company_code = (base_company_code or "").strip()
+    if base_company_code == (company_code or "").strip():
+        base_company_code = ""
 
     if loss_pct is None:
         loss_pct = db.get_metal_loss_pct(company_code)
@@ -210,16 +266,31 @@ def compare(doc: BOMDocument, db: DBConnection,
         base_ctx["LossMst_LmLossPer"] = emperor_loss
 
     # ---- Metals ----
+    # Purity precedence: RmMst (global) → customer RM factor → base-chart RM
+    # factor → CRP (universal). Only the base-factor layer is flagged; the CRP
+    # layer is a shared standard factor, not the base chart.
     rm_codes = list({m.rm_code for m in doc.metals if m.rm_code})
     metal_purity = db.get_metal_purity(rm_codes)
-    metal_factors = db.get_metal_rates(rm_codes, company_code)  # CRP fallback
+    cust_factors = db.get_metal_rates(rm_codes, company_code, include_crp=False)
+    base_factors = (db.get_metal_rates(rm_codes, base_company_code, include_crp=False)
+                    if base_company_code else {})
     crp_factors = db.get_crp_factor(rm_codes)
 
     stone_rm_codes = list({s.rm_code for s in doc.stones if s.rm_code})
     rm_descriptions = db.get_rm_descriptions(list(set(rm_codes + stone_rm_codes)))
 
     for m in doc.metals:
-        purity = metal_purity.get(m.rm_code, metal_factors.get(m.rm_code))
+        purity = None
+        note = ""
+        if m.rm_code in metal_purity:
+            purity = metal_purity[m.rm_code]
+        elif m.rm_code in cust_factors:
+            purity = cust_factors[m.rm_code]
+        elif m.rm_code in base_factors:
+            purity = base_factors[m.rm_code]
+            note = "base chart"
+        elif m.rm_code in crp_factors:
+            purity = crp_factors[m.rm_code]
         ctx = {**base_ctx, "lme": m.lme_rate, "weight": m.weight,
                "qty": m.qty, "line_value": m.value}
         if purity is not None:
@@ -232,15 +303,18 @@ def compare(doc: BOMDocument, db: DBConnection,
         master_val, trace = _eval_component("metal", company_code, ctx)
         desc = rm_descriptions.get(m.rm_code) or f"{m.category} {m.sub_category}".strip()
         rows.append(_row("Metal", m.rm_code, desc, m.value,
-                         master_val, "metal", company_code, trace))
+                         master_val, "metal", company_code, trace, note))
 
     # ---- Stones (diamond / colour) ----
-    stone_lookups = list({(s.rm_code, _stone_lookup_dim(s))
+    stone_lookups = list({(s.rm_code, _stone_candidates(s))
                           for s in doc.stones if s.rm_code})
     stone_prices = db.get_stone_prices(stone_lookups, company_code)
+    stone_prices, base_stone_keys = _fill_from_base(
+        stone_prices, db.get_stone_prices, stone_lookups, base_company_code)
 
     for s in doc.stones:
-        master_price = stone_prices.get((s.rm_code, _stone_lookup_dim(s)))
+        key = (s.rm_code, _stone_candidates(s))
+        master_price = stone_prices.get(key)
         component = "colour_stone" if s.description.strip().upper().startswith("C") else "diamond"
         dim = _stone_lookup_dim(s)
         ctx = {**base_ctx, "weight": s.weight, "qty": s.qty,
@@ -253,8 +327,9 @@ def compare(doc: BOMDocument, db: DBConnection,
                                       "weight": s.weight, "qty": s.qty})
         master_val, trace = _eval_component(component, company_code, ctx)
         desc = rm_descriptions.get(s.rm_code) or f"{s.shape} {s.dimension}".strip()
+        note = "base chart" if key in base_stone_keys else ""
         rows.append(_row("Stone", s.rm_code or s.set_code, desc, s.value,
-                         master_val, component, company_code, trace))
+                         master_val, component, company_code, trace, note))
 
     # ---- Labour (setting / others) and Findings ----
     for lines, section, is_finding in (
@@ -264,21 +339,30 @@ def compare(doc: BOMDocument, db: DBConnection,
     ):
         pairs = list({(l.pointer, l.sub_code) for l in lines if l.pointer})
         rates = db.get_labour_rates(pairs, company_code, weight=metal_weight)
+        rates, base_labour_keys = _fill_from_base(
+            rates,
+            lambda missing, cc: db.get_labour_rates(missing, cc, weight=metal_weight),
+            pairs, base_company_code)
         # Component used for display/edit when the rate (and thus Q/W) is unknown.
         default_component = "finding" if is_finding else "labour_q"
         for l in lines:
-            rate_tuple = rates.get((l.pointer, l.sub_code))
+            key = (l.pointer, l.sub_code)
+            rate_tuple = rates.get(key)
             component = default_component
             ctx = {**base_ctx, "qty": l.qty, "line_value": l.value}
+            note = ""
             if rate_tuple is not None:
-                master_rate, lr_qw = rate_tuple
+                master_rate, lr_qw, lab_min = rate_tuple
                 component = "finding" if is_finding else _labour_component(l.pointer, lr_qw)
                 ctx["LabRt_rate"] = master_rate
+                ctx["LabRt_min"] = lab_min
+                if key in base_labour_keys:
+                    note = "base chart"
             _inject_custom_vars(ctx, db, {"main_code": l.pointer, "sub_code": l.sub_code,
                                           "customer": company_code, "qty": l.qty})
             master_val, trace = _eval_component(component, company_code, ctx)
             rows.append(_row(section, f"{l.pointer}/{l.sub_code}", l.sub_code,
-                             l.value, master_val, component, company_code, trace))
+                             l.value, master_val, component, company_code, trace, note))
 
     return rows
 

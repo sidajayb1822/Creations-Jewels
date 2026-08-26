@@ -31,6 +31,7 @@ class _Worker(QObject):
             # Company code + costing settings come from config / the first design.
             cfg = load_config()
             company_code = (cfg.get("company_code") or "").strip()
+            base_company_code = (cfg.get("base_company_code") or "").strip()
             customer = docs[0].header.customer if docs else ""
             if not company_code and customer and db.is_connected():
                 company_code = db.find_company_code(customer)
@@ -44,7 +45,8 @@ class _Worker(QObject):
 
             results = []
             for d in docs:
-                rows = compare(d, db, company_code=company_code, loss_pct=loss_pct)
+                rows = compare(d, db, company_code=company_code, loss_pct=loss_pct,
+                               base_company_code=base_company_code)
                 stats = summary_stats(rows, multiplier=multiplier)
                 results.append({"label": d.design_label, "rows": rows, "stats": stats})
 
@@ -52,6 +54,8 @@ class _Worker(QObject):
             order_info = (
                 f"{order_no}  |  {customer}  |  {len(docs)} design(s)"
                 + (f"  |  Co: {company_code}" if company_code else "")
+                + (f"  |  Base: {base_company_code}"
+                   if base_company_code and base_company_code != company_code else "")
                 + f"  |  Loss: {loss_pct:g}% ({loss_source})"
                 + (f"  |  ×{multiplier:g}" if multiplier != 1.0 else "")
             )
@@ -78,7 +82,8 @@ class _DesignComparePanel(QWidget):
 
         layout.addWidget(self._build_summary_bar())
 
-        hint = QLabel("Double-click a line to see how it is calculated and edit its formula.")
+        hint = QLabel("Double-click a line to see how it is calculated and edit its formula."
+                      "    * = rate taken from the base chart (customer has no own entry).")
         hint.setStyleSheet("color: #94a3b8; font-size: 11px;")
         layout.addWidget(hint)
 
@@ -284,10 +289,13 @@ def _write_design_sheet(ws, rows: list[ComparisonRow]):
         cell.alignment = Alignment(horizontal="center")
 
     for row in rows:
+        desc = row.description
+        if getattr(row, "source_note", ""):
+            desc = f"{desc} ({row.source_note})".strip()
         ws.append([
             row.section,
             row.code,
-            row.description,
+            desc,
             row.template_value,
             row.master_value if row.master_value is not None else "N/A",
             row.diff_dollar if row.master_value is not None else None,

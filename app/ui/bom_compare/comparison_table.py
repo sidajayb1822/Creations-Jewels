@@ -47,16 +47,24 @@ class ComparisonTable(QTableWidget):
             bg = STATUS_COLORS.get(row.status, QColor("white"))
             fg = TEXT_COLORS.get(row.status, QColor("#0f172a"))
 
+            from_base = bool(getattr(row, "source_note", ""))
+            master_text = (f"{row.master_value:,.2f}" if row.master_value is not None else "N/A")
+            if from_base:
+                master_text += " *"
+
             cells = [
                 row.section,
                 row.code,
                 row.description,
                 f"{row.template_value:,.2f}",
-                f"{row.master_value:,.2f}" if row.master_value is not None else "N/A",
+                master_text,
                 f"{row.diff_dollar:+,.2f}" if row.master_value is not None else "—",
                 f"{row.diff_pct:+.1f}%" if row.master_value is not None else "—",
             ]
 
+            base_tip = (f"From base chart ({row.customer_code or 'fallback'} → "
+                        f"{row.source_note}) — customer chart has no entry"
+                        if from_base else "")
             for c_idx, text in enumerate(cells):
                 item = QTableWidgetItem(text)
                 item.setBackground(QBrush(bg))
@@ -65,6 +73,8 @@ class ComparisonTable(QTableWidget):
                     item.setTextAlignment(
                         Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
                     )
+                if from_base:
+                    item.setToolTip(base_tip)
                 # Stash the source row on col 0 so clicks survive sorting.
                 if c_idx == 0:
                     item.setData(Qt.ItemDataRole.UserRole, row)

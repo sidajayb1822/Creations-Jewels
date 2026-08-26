@@ -52,6 +52,15 @@ class LineDetailDialog(QDialog):
         vals.setTextFormat(Qt.TextFormat.RichText)
         layout.addWidget(vals)
 
+        # Base-chart provenance
+        if getattr(r, "source_note", ""):
+            src = QLabel(f"⚑ Rate source: <b>{r.source_note}</b> — the customer's own "
+                        f"chart has no entry for this line, so the fallback chart was used.")
+            src.setTextFormat(Qt.TextFormat.RichText)
+            src.setWordWrap(True)
+            src.setStyleSheet("color: #92400e; font-size: 11px;")
+            layout.addWidget(src)
+
         # Formula
         fd = formula_store.get(r.component, r.customer_code)
         scope = "default"

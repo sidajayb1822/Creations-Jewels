@@ -74,6 +74,19 @@ class SettingsDialog(QDialog):
         self.company_edit.setPlaceholderText("e.g.  OM-LGD   (blank = detect from BOM customer)")
         cform.addRow("Company code:", self.company_edit)
 
+        self.base_company_edit = QLineEdit()
+        self.base_company_edit.setPlaceholderText("e.g.  ZSELF   (blank = no fallback)")
+        cform.addRow("Base chart code:", self.base_company_edit)
+
+        base_hint = QLabel(
+            "Fallback rate chart. When the customer's own chart has no rate for a "
+            "line, it is filled from this chart instead of showing N/A (and flagged "
+            "as “base chart”). Never overrides a customer's own rate."
+        )
+        base_hint.setWordWrap(True)
+        base_hint.setStyleSheet("color: #64748b; font-size: 11px;")
+        cform.addRow("", base_hint)
+
         self.loss_spin = QDoubleSpinBox()
         self.loss_spin.setRange(0.0, 100.0)
         self.loss_spin.setDecimals(2)
@@ -125,6 +138,7 @@ class SettingsDialog(QDialog):
         self.pass_edit.setText(cfg.get("password", ""))
         self.timeout_spin.setValue(cfg.get("timeout", 10))
         self.company_edit.setText(cfg.get("company_code", ""))
+        self.base_company_edit.setText(cfg.get("base_company_code", ""))
         self.loss_spin.setValue(float(cfg.get("metal_loss_pct", DEFAULT_METAL_LOSS_PCT)))
         self._on_auth_changed(self.auth_combo.currentIndex())
 
@@ -138,6 +152,7 @@ class SettingsDialog(QDialog):
             "password": self.pass_edit.text(),
             "timeout": self.timeout_spin.value(),
             "company_code": self.company_edit.text().strip(),
+            "base_company_code": self.base_company_edit.text().strip(),
             "metal_loss_pct": self.loss_spin.value(),
         }
 

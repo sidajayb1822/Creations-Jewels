@@ -41,6 +41,7 @@ DEFAULT_CONFIG = {
     "timeout": 10,
     "query_timeout": 30,  # seconds a single query may run before it aborts
     "company_code": "",   # Emperor customer company code, e.g. "OM-LGD"
+    "base_company_code": "",  # fallback rate chart when the customer has no entry, e.g. "ZSELF"
     "metal_loss_pct": 10.0,   # fallback when LossMst has no matching row
 }
 
@@ -165,13 +166,17 @@ class DBConnection:
     # Actual rate per gram = RrSalRt * (LME_per_troy_oz / 31.1035)
     # For metals, RrFrLn/RrToLn are typically 0/9999 (any weight).
     # ------------------------------------------------------------------
-    def get_metal_rates(self, rm_codes: list[str], company_code: str) -> dict[str, float]:
+    def get_metal_rates(self, rm_codes: list[str], company_code: str,
+                        include_crp: bool = True) -> dict[str, float]:
         """
         Returns {rm_code: RrSalRt purity_factor}.
         Master rate per gram = purity_factor × (LME_per_troy_oz / 31.1035).
         Strategy:
           1. Try customer-specific RM-type rate (RrTcTyp='RM', RrCmCd=company_code)
           2. Fall back to CRP-type purity factor (applies to all customers uniformly)
+        When include_crp=False, only step 1 is returned (customer-specific factors
+        only) so callers can layer their own fallbacks (e.g. a base chart) between
+        the customer rate and CRP.
         """
         if not rm_codes:
             return {}
@@ -193,7 +198,7 @@ class DBConnection:
                 pass
 
         # Fall back to CRP (standard purity factor) for any codes still missing
-        missing = [c for c in rm_codes if c not in result]
+        missing = [c for c in rm_codes if c not in result] if include_crp else []
         if missing:
             placeholders2 = ",".join("?" * len(missing))
             sql2 = f"""
@@ -320,36 +325,62 @@ class DBConnection:
     # ------------------------------------------------------------------
     def get_stone_prices(
         self,
-        lookups: list[tuple[str, float]],   # [(rm_code, pointer_value), ...]
+        lookups: list[tuple[str, tuple]],   # [(rm_code, (pointer, L1, L2, L3)), ...]
         company_code: str,
-    ) -> dict[tuple[str, float], float]:
+    ) -> dict[tuple[str, tuple], float]:
         """
-        Returns {(rm_code, pointer_value): RrSalRt_per_carat}.
-        Uses RrFrLn <= pointer_value <= RrToLn for range-based pricing.
+        Returns {(rm_code, candidates): RrSalRt_per_carat}.
+
+        `candidates` is (pointer_carats, L1, L2, L3). A stone's rate table may be
+        banded either by carat (large solitaires) or by millimetre size (melee /
+        baguettes), and a small melee stone can carry BOTH a tiny carat value and
+        an mm size — so we pick the dimension that actually lands in one of the
+        stone's own rate bands:
+          1. the carat pointer if it falls in a band (solitaire case), else
+          2. the LARGEST millimetre dimension that falls in a band (melee case).
+        Zeros in `candidates` are placeholders and are never matched.
         """
         if not lookups or not company_code:
             return {}
-        result: dict[tuple[str, float], float] = {}
-        for rm_code, pointer_val in lookups:
+        result: dict[tuple[str, tuple], float] = {}
+        for rm_code, candidates in lookups:
             if not rm_code:
                 continue
-            sql = """
-                SELECT TOP 1 RrSalRt
-                FROM RmRt
-                WHERE RrCd = ?
-                  AND RrCmCd = ?
-                  AND RrTcTyp = 'RM'
-                  AND RrFrLn <= ?
-                  AND RrToLn >= ?
-                ORDER BY ABS(RrToLn - ?) ASC
-            """
             try:
-                rows = self._execute(sql, (rm_code, company_code,
-                                           pointer_val, pointer_val, pointer_val))
-                if rows:
-                    result[(rm_code, pointer_val)] = float(rows[0]["RrSalRt"] or 0)
+                bands = self._execute(
+                    "SELECT RrFrLn, RrToLn, RrSalRt FROM RmRt "
+                    "WHERE RrCd = ? AND RrCmCd = ? AND RrTcTyp = 'RM'",
+                    (rm_code, company_code),
+                )
             except Exception:
-                pass
+                continue
+            if not bands:
+                continue
+
+            def _rate_for(dim: float):
+                """Rate of the tightest band containing dim, or None."""
+                if not dim or dim <= 0:
+                    return None
+                best, best_span = None, None
+                for b in bands:
+                    fr, to = float(b["RrFrLn"] or 0), float(b["RrToLn"] or 0)
+                    if fr <= dim <= to:
+                        span = to - fr
+                        if best_span is None or span < best_span:
+                            best, best_span = float(b["RrSalRt"] or 0), span
+                return best
+
+            pointer = candidates[0] if candidates else 0.0
+            mm_dims = sorted((d for d in candidates[1:] if d and d > 0), reverse=True)
+
+            rate = _rate_for(pointer)          # carat pointer first
+            if rate is None:
+                for dim in mm_dims:            # else largest mm dim in a band
+                    rate = _rate_for(dim)
+                    if rate is not None:
+                        break
+            if rate is not None:
+                result[(rm_code, candidates)] = rate
         return result
 
     # ------------------------------------------------------------------
@@ -363,34 +394,50 @@ class DBConnection:
         pairs: list[tuple[str, str]],   # [(main_code, sub_code), ...]
         company_code: str,
         weight: float = 0.0,
-    ) -> dict[tuple[str, str], tuple[float, str]]:
+    ) -> dict[tuple[str, str], tuple[float, str, float]]:
         """
-        Returns {(main_code, sub_code): (LrSalRt, LrQw)}.
+        Returns {(main_code, sub_code): (LrSalRt, LrQw, LrSalMin)}.
         LrQw='Q' → rate per piece; LrQw='W' → rate per gram of metal.
+        LrSalMin = minimum charge for this labour (0 when not set); Emperor
+        bills max(rate × basis, LrSalMin).
         Pass piece weight so the correct tier row is selected.
         """
         if not pairs or not company_code:
             return {}
-        result: dict[tuple[str, str], tuple[float, str]] = {}
+        result: dict[tuple[str, str], tuple[float, str, float]] = {}
         for main_code, sub_code in pairs:
             if not main_code:
                 continue
+            # Pick the weight band that CONTAINS the piece weight. This applies
+            # to per-piece ('Q') rows too — many CFP/RNG-style rates are tiered
+            # by weight even when charged per piece, so we must NOT bypass the
+            # band filter for 'Q' (the old code did, and always returned the
+            # lowest tier). Ordering:
+            #   1) bands containing the weight sort first;
+            #   2) among containing bands, the tightest (smallest LrToWt) wins;
+            #      among non-containing bands (weight heavier than every band)
+            #      the largest band wins, so an overweight piece falls back to
+            #      the top tier instead of returning nothing.
+            # Flat rows (a single 0-99 / 0-9999 band) match and are unaffected.
             sql = """
-                SELECT TOP 1 LrSalRt, LrQw
+                SELECT TOP 1 LrSalRt, LrQw, LrSalMin
                 FROM LabRt
                 WHERE LrMCd = ?
                   AND LrSCd = ?
                   AND LrCmCd = ?
-                  AND (LrQw = 'Q' OR (LrFrWt <= ? AND LrToWt >= ?))
-                ORDER BY LrToWt ASC
+                ORDER BY
+                  CASE WHEN LrFrWt <= ? AND LrToWt >= ? THEN 0 ELSE 1 END,
+                  CASE WHEN LrFrWt <= ? AND LrToWt >= ? THEN LrToWt
+                       ELSE (1000000 - LrToWt) END
             """
             try:
                 rows = self._execute(sql, (main_code, sub_code, company_code,
-                                           weight, weight))
+                                           weight, weight, weight, weight))
                 if rows:
                     result[(main_code, sub_code)] = (
                         float(rows[0]["LrSalRt"] or 0),
                         (rows[0]["LrQw"] or "Q").strip(),
+                        float(rows[0]["LrSalMin"] or 0),
                     )
             except Exception:
                 pass
@@ -430,15 +477,30 @@ class DBConnection:
             return []
 
     def find_company_code(self, customer_name: str) -> str:
-        """Try to match BOM customer name to a CustMst entry."""
-        if not customer_name:
+        """
+        Match a BOM customer name to a CustMst code, preferring the most precise
+        match so a decorated lookalike can't win by accident:
+          1. exact name (case-insensitive) — e.g. "OM JEWELRY INC" → OMJEWLRY,
+             not "OM JEWELRY INC (LGD)" (OM-LGD);
+          2. else "starts with", shortest (closest) name first;
+          3. else "contains", shortest name first (last-resort, = old behaviour).
+        """
+        name = (customer_name or "").strip()
+        if not name:
             return ""
         try:
-            rows = self._execute(
-                "SELECT TOP 1 CmCd FROM CustMst WHERE CmName LIKE ?",
-                (f"%{customer_name.strip()[:20]}%",)
-            )
-            return rows[0]["CmCd"] if rows else ""
+            for sql, param in (
+                ("SELECT TOP 1 CmCd FROM CustMst WHERE CmName = ? ORDER BY LEN(CmName)",
+                 name),
+                ("SELECT TOP 1 CmCd FROM CustMst WHERE CmName LIKE ? ORDER BY LEN(CmName)",
+                 name + "%"),
+                ("SELECT TOP 1 CmCd FROM CustMst WHERE CmName LIKE ? ORDER BY LEN(CmName)",
+                 f"%{name[:20]}%"),
+            ):
+                rows = self._execute(sql, (param,))
+                if rows:
+                    return rows[0]["CmCd"]
+            return ""
         except Exception:
             return ""
 
