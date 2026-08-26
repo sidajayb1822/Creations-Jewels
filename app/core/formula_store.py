@@ -71,6 +71,11 @@ SEED_DEFAULTS: dict[str, FormulaDef] = {
         expression="max(LabRt_rate * diamond_weight, LabRt_min)",
         notes="Diamond-weight labour (CDW) = rate × total diamond carats, floored at the minimum charge.",
     ),
+    "setting": FormulaDef(
+        component="setting",
+        expression="max(LabRt_rate * qty, LabRt_min)",
+        notes="Stone setting = SET rate (LabRt LrMCd='SET') × number of stones set, floored at the minimum charge.",
+    ),
 }
 
 # Old labour seed expressions (pre-minimum). Untouched defaults matching these

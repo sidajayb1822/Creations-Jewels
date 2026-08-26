@@ -105,12 +105,17 @@ class DBConnection:
         # tab loads can't trigger "Connection is busy with results for another
         # command" or corrupt each other.
         self._lock = threading.RLock()
+        # Cache of raw SET-rate bands keyed by (company, set_code) so a stone's
+        # setting rate is fetched once per code, not once per stone (read-only DB
+        # → safe to cache for the session).
+        self._setting_band_cache: dict = {}
 
     def connect(self, config: Optional[dict] = None) -> None:
         if not PYODBC_AVAILABLE:
             raise RuntimeError("pyodbc is not installed.")
         cfg = config or load_config()
         self._config = cfg
+        self._setting_band_cache = {}
         conn_str = build_connection_string(cfg)
         conn = pyodbc.connect(conn_str, autocommit=True)
         # Per-query timeout so a slow query aborts with an error instead of
@@ -137,6 +142,11 @@ class DBConnection:
 
     def is_connected(self) -> bool:
         return self._conn is not None
+
+    def clear_caches(self) -> None:
+        """Drop any cached rate data so the next lookup re-queries Emperor.
+        Used by the Refresh button to pick up rate changes without reconnecting."""
+        self._setting_band_cache = {}
 
     def disconnect(self) -> None:
         if self._conn:
@@ -442,6 +452,60 @@ class DBConnection:
             except Exception:
                 pass
         return result
+
+    # ------------------------------------------------------------------
+    # Stone setting rate  (LabRt with LrMCd='SET')
+    # Cached per (company, set_code) so a design's many stones sharing a code
+    # cost ONE query, not one per stone. Band chosen on per-stone weight.
+    # ------------------------------------------------------------------
+    def _setting_bands(self, set_code: str, company_code: str) -> list:
+        key = (company_code, set_code)
+        bands = self._setting_band_cache.get(key)
+        if bands is None:
+            try:
+                bands = self._execute(
+                    "SELECT LrQw, LrFrWt, LrToWt, LrSalRt, LrSalMin FROM LabRt "
+                    "WHERE LrMCd='SET' AND LrSCd=? AND LrCmCd=?",
+                    (set_code, company_code),
+                )
+            except Exception:
+                bands = []
+            self._setting_band_cache[key] = bands
+        return bands
+
+    @staticmethod
+    def _pick_band(bands: list, weight: float):
+        """Pick the band containing weight (tightest), else the top band; mirrors
+        get_labour_rates' ordering. Returns (rate, qw, min) or None."""
+        best, best_key = None, None
+        for b in bands:
+            fr, to = float(b["LrFrWt"] or 0), float(b["LrToWt"] or 0)
+            contains = fr <= weight <= to
+            k = (0 if contains else 1, to if contains else (1_000_000 - to))
+            if best_key is None or k < best_key:
+                best, best_key = b, k
+        if best is None:
+            return None
+        return (float(best["LrSalRt"] or 0), (best["LrQw"] or "Q").strip(),
+                float(best["LrSalMin"] or 0))
+
+    def get_setting_rate(self, set_code: str, company_code: str, weight: float,
+                         base_company_code: str = ""):
+        """
+        Returns (rate, qw, min, from_base) for SET/<set_code> at the given
+        per-stone weight, trying the customer chart then the base chart; or None.
+        """
+        if not set_code or not company_code:
+            return None
+        r = self._pick_band(self._setting_bands(set_code, company_code), weight)
+        if r is not None:
+            return (*r, False)
+        base = (base_company_code or "").strip()
+        if base and base != company_code:
+            rb = self._pick_band(self._setting_bands(set_code, base), weight)
+            if rb is not None:
+                return (*rb, True)
+        return None
 
     # ------------------------------------------------------------------
     # RM descriptions (RmMst.RmDesc)

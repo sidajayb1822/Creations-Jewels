@@ -4,7 +4,7 @@ from PySide6.QtWidgets import (
     QPushButton, QFileDialog, QMessageBox,
     QGroupBox, QGridLayout, QTabWidget, QLineEdit,
 )
-from PySide6.QtCore import Qt, QThread, Signal, QObject
+from PySide6.QtCore import QThread, Signal, QObject
 from PySide6.QtGui import QFont, QColor
 
 from app.ui.bom_compare.drop_zone import DropZone
@@ -158,11 +158,26 @@ class BOMCompareWidget(QWidget):
         self.drop_zone.file_dropped.connect(self._on_file)
         drop_row.addWidget(self.drop_zone)
 
+        # Browse + Refresh stacked vertically so neither gets squished.
+        btn_col = QVBoxLayout()
+        btn_col.setSpacing(6)
+
         browse_btn = QPushButton("Browse…")
         browse_btn.setObjectName("outlineBtn")
-        browse_btn.setFixedWidth(90)
+        browse_btn.setFixedWidth(100)
         browse_btn.clicked.connect(self._browse)
-        drop_row.addWidget(browse_btn, alignment=Qt.AlignmentFlag.AlignBottom)
+        btn_col.addWidget(browse_btn)
+
+        self.refresh_btn = QPushButton("↻ Refresh")
+        self.refresh_btn.setObjectName("outlineBtn")
+        self.refresh_btn.setFixedWidth(100)
+        self.refresh_btn.setToolTip("Re-pull rates from Emperor and re-run the "
+                                    "comparison for the current file.")
+        self.refresh_btn.setEnabled(False)
+        self.refresh_btn.clicked.connect(self._refresh)
+        btn_col.addWidget(self.refresh_btn)
+
+        drop_row.addLayout(btn_col)
         layout.addLayout(drop_row)
 
         self.order_label = QLabel("No file loaded")
@@ -250,6 +265,14 @@ class BOMCompareWidget(QWidget):
         self.search_edit.blockSignals(False)
         self.search_edit.setVisible(len(results) > 1)
         self.export_btn.setEnabled(bool(results))
+        self.refresh_btn.setEnabled(bool(self._last_path))
+
+    def _refresh(self):
+        """Drop cached rates and re-run the comparison against fresh Emperor data."""
+        if not self._last_path:
+            return
+        db.clear_caches()
+        self._reload()
 
     def _filter_tabs(self, text: str):
         """Show only design tabs whose name contains the search text."""

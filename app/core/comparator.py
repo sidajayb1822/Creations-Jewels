@@ -331,6 +331,28 @@ def compare(doc: BOMDocument, db: DBConnection,
         rows.append(_row("Stone", s.rm_code or s.set_code, desc, s.value,
                          master_val, component, company_code, trace, note))
 
+        # ---- Setting cost for this stone (SET/<code>, from LabRt) ----
+        # Master setting rate lives in LabRt with LrMCd='SET'; the weight band is
+        # matched on the PER-STONE weight (total carat / qty), and the value is
+        # rate × number of stones set.
+        if s.set_code and (s.setting_total or s.rate_each):
+            per_stone_wt = (s.weight / s.qty) if s.qty else 0.0
+            set_ctx = {**base_ctx, "qty": s.qty, "line_value": s.setting_total,
+                       "setting_rate": s.rate_each, "setting_qty": s.qty}
+            set_note = ""
+            set_res = db.get_setting_rate(s.set_code, company_code, per_stone_wt,
+                                          base_company_code)
+            if set_res is not None:
+                set_rate, _sqw, set_min, set_from_base = set_res
+                set_ctx["LabRt_rate"] = set_rate
+                set_ctx["LabRt_min"] = set_min
+                if set_from_base:
+                    set_note = "base chart"
+            set_master, set_trace = _eval_component("setting", company_code, set_ctx)
+            rows.append(_row("Stone Setting", f"SET/{s.set_code}",
+                             f"{desc} setting".strip(), s.setting_total,
+                             set_master, "setting", company_code, set_trace, set_note))
+
     # ---- Labour (setting / others) and Findings ----
     for lines, section, is_finding in (
         (doc.labour_setting, "Labour (Setting)", False),
