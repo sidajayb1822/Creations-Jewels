@@ -36,7 +36,10 @@ class _Worker(QObject):
             if not company_code and customer and db.is_connected():
                 company_code = db.find_company_code(customer)
 
-            loss_pct = db.get_metal_loss_pct(company_code)
+            # Header shows the loss for the first metal's category; the actual
+            # loss is applied per metal category inside compare().
+            first_cat = next((d.metals[0].category for d in docs if d.metals), "")
+            loss_pct = db.get_metal_loss_pct(company_code, first_cat)
             loss_source = "Emperor"
             if loss_pct is None:
                 loss_pct = float(cfg.get("metal_loss_pct", DEFAULT_METAL_LOSS_PCT))

@@ -243,10 +243,10 @@ def compare(doc: BOMDocument, db: DBConnection,
     if base_company_code == (company_code or "").strip():
         base_company_code = ""
 
-    if loss_pct is None:
-        loss_pct = db.get_metal_loss_pct(company_code)
-        if loss_pct is None:
-            loss_pct = DEFAULT_METAL_LOSS_PCT
+    # Doc-level fallback loss %. The authoritative loss is looked up per metal
+    # category (RmRt 'LS' rows are keyed by company + RrCtg) inside the metal
+    # loop below; this value is only used when a category has no LS row.
+    default_loss = loss_pct if loss_pct is not None else DEFAULT_METAL_LOSS_PCT
 
     # Aggregates shared by every line's context.
     metal_weight = sum(m.weight for m in doc.metals)
@@ -255,15 +255,12 @@ def compare(doc: BOMDocument, db: DBConnection,
     colour_weight = sum(s.weight for s in doc.stones
                         if s.description.strip().upper().startswith("C"))
     base_ctx = {
-        "loss_pct": loss_pct,
+        "loss_pct": default_loss,
         "metal_weight": metal_weight,
         "diamond_weight": diamond_weight,
         "colour_weight": colour_weight,
         "CmMulBy": db.get_customer_multiplier(company_code),
     }
-    emperor_loss = db.get_metal_loss_pct(company_code)
-    if emperor_loss is not None:
-        base_ctx["LossMst_LmLossPer"] = emperor_loss
 
     # ---- Metals ----
     # Purity precedence: RmMst (global) → customer RM factor → base-chart RM
@@ -293,6 +290,11 @@ def compare(doc: BOMDocument, db: DBConnection,
             purity = crp_factors[m.rm_code]
         ctx = {**base_ctx, "lme": m.lme_rate, "weight": m.weight,
                "qty": m.qty, "line_value": m.value}
+        # Loss % for this metal's category (G/P/S); fall back to the doc default.
+        cat_loss = db.get_metal_loss_pct(company_code, m.category)
+        ctx["loss_pct"] = cat_loss if cat_loss is not None else default_loss
+        if cat_loss is not None:
+            ctx["LossMst_LmLossPer"] = cat_loss
         if purity is not None:
             ctx["RmMst_RmPurityRt"] = purity
         crp = crp_factors.get(m.rm_code)

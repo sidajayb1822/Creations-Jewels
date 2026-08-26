@@ -278,34 +278,52 @@ class DBConnection:
     # ------------------------------------------------------------------
     # Metal loss %  (wastage uplift on the fine rate)
     # ------------------------------------------------------------------
-    def get_metal_loss_pct(self, company_code: str) -> Optional[float]:
+    def get_metal_loss_pct(self, company_code: str,
+                           category: str = "") -> Optional[float]:
         """
-        Returns the loss % for this customer, or None if Emperor has none
-        configured (caller then falls back to the configured default).
+        Returns the wastage loss % for a customer + metal category, or None when
+        Emperor has none (caller then falls back to the configured default).
 
-        CustMst.CmLkUpMetLs names a loss group that should resolve into
-        LossMst.LmLossPer. LossMst is empty in the EmrDaily restore and
-        CmLkUpMetLs is blank for most customers, so the exact join column is
-        UNVERIFIED — confirm with the client before relying on this path.
+        Source (confirmed with the client): RmRt rows with RrTcTyp='LS', keyed by
+        RrCmCd (company) and RrCtg (metal category: G=gold, P=platinum, S=silver);
+        RrSalRt is the loss %. E.g. OMJEWLRY/G=10, 9ADNAPRC/G=12, OM-LGD/P=18.
+        When `category` is given we match it; otherwise the company's first LS row
+        is used. (The legacy CustMst->LossMst path is kept as a secondary fallback;
+        LossMst is empty in the current data.)
         """
         if not company_code:
             return None
+        cat = (category or "").strip()
+        try:
+            if cat:
+                rows = self._execute(
+                    "SELECT TOP 1 RrSalRt FROM RmRt "
+                    "WHERE RrTcTyp='LS' AND RrCmCd=? AND RrCtg=?",
+                    (company_code, cat),
+                )
+            else:
+                rows = self._execute(
+                    "SELECT TOP 1 RrSalRt FROM RmRt WHERE RrTcTyp='LS' AND RrCmCd=?",
+                    (company_code,),
+                )
+            if rows and rows[0]["RrSalRt"] is not None:
+                return float(rows[0]["RrSalRt"])
+        except Exception:
+            pass
+        # Legacy fallback: CustMst.CmLkUpMetLs -> LossMst (empty in current data).
         try:
             rows = self._execute(
                 "SELECT CmLkUpMetLs FROM CustMst WHERE CmCd = ?", (company_code,)
             )
-            if not rows:
-                return None
-            group = (rows[0].get("CmLkUpMetLs") or "").strip()
-            if not group:
-                return None
-            loss = self._execute(
-                "SELECT TOP 1 LmLossPer FROM LossMst "
-                "WHERE LmCoCd = ? AND ISNULL(LmValidYn,'Y') <> 'N'",
-                (group,),
-            )
-            if loss and loss[0]["LmLossPer"] is not None:
-                return float(loss[0]["LmLossPer"])
+            group = (rows[0].get("CmLkUpMetLs") or "").strip() if rows else ""
+            if group:
+                loss = self._execute(
+                    "SELECT TOP 1 LmLossPer FROM LossMst "
+                    "WHERE LmCoCd = ? AND ISNULL(LmValidYn,'Y') <> 'N'",
+                    (group,),
+                )
+                if loss and loss[0]["LmLossPer"] is not None:
+                    return float(loss[0]["LmLossPer"])
         except Exception:
             pass
         return None
