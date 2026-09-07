@@ -28,6 +28,7 @@ class MetalLine:
     lme_rate: float = 0.0
     rate: float = 0.0
     value: float = 0.0
+    source_row: int = 0   # 1-based Excel row this line was parsed from
 
 
 @dataclass
@@ -46,6 +47,7 @@ class StoneLine:
     sub_code: str = ""        # Setting sub-code (col 3, kept for compat)
     rate_each: float = 0.0    # Setting rate per stone (col 13)
     setting_total: float = 0.0  # Setting total value (col 14)
+    source_row: int = 0       # 1-based Excel row this line was parsed from
 
 
 @dataclass
@@ -59,6 +61,7 @@ class LabourLine:
     qty: float = 0.0
     rate: float = 0.0
     value: float = 0.0
+    source_row: int = 0   # 1-based Excel row this line was parsed from
 
 
 @dataclass
@@ -71,6 +74,7 @@ class FindingLine:
     qty: float = 0.0
     rate: float = 0.0
     value: float = 0.0
+    source_row: int = 0   # 1-based Excel row this line was parsed from
 
 
 @dataclass

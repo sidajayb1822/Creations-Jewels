@@ -51,6 +51,7 @@ class ComparisonRow:
     customer_code: str = ""  # company code the formula was resolved for
     trace: list[TraceStep] = field(default_factory=list)
     source_note: str = ""    # e.g. "base chart" when the rate came from the fallback chart
+    source_row: int = 0      # 1-based Excel row this line came from (for highlight export)
 
 
 def _pct(template: float, master: float) -> float:
@@ -176,7 +177,8 @@ def _eval_component(component: str, company_code: str,
 
 def _row(section: str, code: str, description: str, template_val: float,
          master_val: Optional[float], component: str, company_code: str,
-         trace: list[TraceStep], source_note: str = "") -> ComparisonRow:
+         trace: list[TraceStep], source_note: str = "",
+         source_row: int = 0) -> ComparisonRow:
     diff = round((master_val or 0.0) - template_val, 2)
     pct = _pct(template_val, master_val or 0.0) if master_val is not None else 0.0
     return ComparisonRow(
@@ -192,6 +194,7 @@ def _row(section: str, code: str, description: str, template_val: float,
         customer_code=company_code,
         trace=trace,
         source_note=source_note,
+        source_row=source_row,
     )
 
 
@@ -274,7 +277,9 @@ def compare(doc: BOMDocument, db: DBConnection,
     crp_factors = db.get_crp_factor(rm_codes)
 
     stone_rm_codes = list({s.rm_code for s in doc.stones if s.rm_code})
-    rm_descriptions = db.get_rm_descriptions(list(set(rm_codes + stone_rm_codes)))
+    chain_rm_codes = list({ch.rm_code for ch in doc.chain if ch.rm_code})
+    rm_descriptions = db.get_rm_descriptions(
+        list(set(rm_codes + stone_rm_codes + chain_rm_codes)))
 
     for m in doc.metals:
         purity = None
@@ -305,7 +310,8 @@ def compare(doc: BOMDocument, db: DBConnection,
         master_val, trace = _eval_component("metal", company_code, ctx)
         desc = rm_descriptions.get(m.rm_code) or f"{m.category} {m.sub_category}".strip()
         rows.append(_row("Metal", m.rm_code, desc, m.value,
-                         master_val, "metal", company_code, trace, note))
+                         master_val, "metal", company_code, trace, note,
+                         source_row=m.source_row))
 
     # ---- Stones (diamond / colour) ----
     stone_lookups = list({(s.rm_code, _stone_candidates(s))
@@ -331,7 +337,8 @@ def compare(doc: BOMDocument, db: DBConnection,
         desc = rm_descriptions.get(s.rm_code) or f"{s.shape} {s.dimension}".strip()
         note = "base chart" if key in base_stone_keys else ""
         rows.append(_row("Stone", s.rm_code or s.set_code, desc, s.value,
-                         master_val, component, company_code, trace, note))
+                         master_val, component, company_code, trace, note,
+                         source_row=s.source_row))
 
         # ---- Setting cost for this stone (SET/<code>, from LabRt) ----
         # Master setting rate lives in LabRt with LrMCd='SET'; the weight band is
@@ -353,7 +360,8 @@ def compare(doc: BOMDocument, db: DBConnection,
             set_master, set_trace = _eval_component("setting", company_code, set_ctx)
             rows.append(_row("Stone Setting", f"SET/{s.set_code}",
                              f"{desc} setting".strip(), s.setting_total,
-                             set_master, "setting", company_code, set_trace, set_note))
+                             set_master, "setting", company_code, set_trace, set_note,
+                             source_row=s.source_row))
 
     # ---- Labour (setting / others) and Findings ----
     for lines, section, is_finding in (
@@ -386,7 +394,35 @@ def compare(doc: BOMDocument, db: DBConnection,
                                           "customer": company_code, "qty": l.qty})
             master_val, trace = _eval_component(component, company_code, ctx)
             rows.append(_row(section, f"{l.pointer}/{l.sub_code}", l.sub_code,
-                             l.value, master_val, component, company_code, trace, note))
+                             l.value, master_val, component, company_code, trace, note,
+                             source_row=l.source_row))
+
+    # ---- Chain & Accessories ----
+    # Accessory RM codes (RmCtg='X') charged per piece; master rate is the RmRt
+    # RM-type row banded by the design's gold price (LME). Value = rate × basis.
+    if doc.chain:
+        chain_codes = list({ch.rm_code for ch in doc.chain if ch.rm_code})
+        lme = max((m.lme_rate for m in doc.metals), default=0.0)
+        chain_rates = db.get_chain_rates(chain_codes, company_code, lme)
+        chain_rates, chain_base_keys = _fill_from_base(
+            chain_rates,
+            lambda missing, cc: db.get_chain_rates(missing, cc, lme),
+            chain_codes, base_company_code)
+        for ch in doc.chain:
+            if not ch.rm_code:
+                continue
+            ctx = {**base_ctx, "qty": ch.qty, "weight": ch.weight,
+                   "line_value": ch.value}
+            note = ""
+            if ch.rm_code in chain_rates:
+                ctx["RmRt_rate"] = chain_rates[ch.rm_code]
+                if ch.rm_code in chain_base_keys:
+                    note = "base chart"
+            master_val, trace = _eval_component("chain", company_code, ctx)
+            desc = rm_descriptions.get(ch.rm_code) or f"{ch.category} {ch.sub_category}".strip()
+            rows.append(_row("Chain", ch.rm_code, desc, ch.value,
+                             master_val, "chain", company_code, trace, note,
+                             source_row=ch.source_row))
 
     return rows
 

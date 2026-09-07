@@ -227,6 +227,59 @@ class DBConnection:
         return result
 
     # ------------------------------------------------------------------
+    # Chain & accessories rate (RmRt RM-type, banded by the gold price)
+    # These are RmCtg='X' accessory codes charged per piece; the RM rate row
+    # is selected by the band that contains the design's LME (gold $/oz).
+    # ------------------------------------------------------------------
+    def get_chain_rates(self, rm_codes: list[str], company_code: str,
+                        lme: float = 0.0) -> dict[str, float]:
+        """Returns {rm_code: rate} for chain/accessory (category-X) codes.
+
+        Emperor prices these by interpolating within a gold-price band:
+            rate = RrSalRt + (LME - RrFrLn) * increment
+        where the per-code increment is stored in RmRt.RrFixMinTol (the sale-rate
+        increment per $/oz above the band floor; = RrFixMaxTol). When the increment
+        is 0 the rate is simply RrSalRt for the band whose RrFrLn..RrToLn contains
+        the LME (fixed rate decided in the band). The band is picked as the one
+        containing `lme`, else the widest; `lme` is clamped into the band so the
+        rate never extrapolates past RrToLn. Verified against the client's
+        ZSELF chart (e.g. 14KYDBNOCPST: 1.63 + (4076-1000)*0.0011 = 5.014)."""
+        if not rm_codes or not company_code:
+            return {}
+        result: dict[str, float] = {}
+        for code in rm_codes:
+            if not code:
+                continue
+            try:
+                rows = self._execute(
+                    "SELECT RrFrLn, RrToLn, RrSalRt, RrFixMinTol FROM RmRt "
+                    "WHERE RrCd=? AND RrCmCd=? AND RrTcTyp='RM'",
+                    (code, company_code),
+                )
+            except Exception:
+                continue
+            if not rows:
+                continue
+            best, best_key = None, None
+            for r in rows:
+                fr, to = float(r["RrFrLn"] or 0), float(r["RrToLn"] or 0)
+                contains = fr <= lme <= to
+                # containing band first; among the rest, the widest range.
+                key = (0 if contains else 1, -(to - fr))
+                if best_key is None or key < best_key:
+                    best, best_key = r, key
+            if best is not None:
+                fr = float(best["RrFrLn"] or 0)
+                to = float(best["RrToLn"] or 0)
+                base = float(best["RrSalRt"] or 0)
+                inc = float(best["RrFixMinTol"] or 0)
+                # clamp LME into the band so the rate never extrapolates; inc==0
+                # collapses this to the flat band rate (base).
+                eff = min(max(lme, fr), to) if to > fr else lme
+                result[code] = base + (eff - fr) * inc
+        return result
+
+    # ------------------------------------------------------------------
     # Metal purity  (RmMst.RmPurityRt)
     # This is the authoritative purity factor per the client's costing
     # reference (CJ DB ref.xlsx) — G14 = 0.5833, i.e. 14/24. Prefer it over

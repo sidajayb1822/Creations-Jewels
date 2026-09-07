@@ -132,6 +132,7 @@ def _parse_metals(ws: Worksheet) -> list[MetalLine]:
             lme_rate=_float(ws.cell(row=r, column=8)),
             rate=_float(ws.cell(row=r, column=9)),
             value=_float(ws.cell(row=r, column=10)),
+            source_row=r,
         )
         if line.rm_code:
             lines.append(line)
@@ -174,6 +175,7 @@ def _parse_stones(ws: Worksheet) -> list[StoneLine]:
             sub_code=_str(ws.cell(row=r, column=3)),
             rate_each=_float(ws.cell(row=r, column=13)),    # setting rate per stone
             setting_total=_float(ws.cell(row=r, column=14)),
+            source_row=r,
         )
         if line.rm_code or line.shape:
             lines.append(line)
@@ -210,6 +212,7 @@ def _parse_labour(ws: Worksheet, keyword: str, section_label: str) -> list[Labou
             qty=_float(ws.cell(row=r, column=5)),
             rate=_float(ws.cell(row=r, column=6)),
             value=_float(ws.cell(row=r, column=7)),
+            source_row=r,
         )
         if line.pointer:
             lines.append(line)
@@ -247,6 +250,7 @@ def _parse_chain(ws: Worksheet) -> list[MetalLine]:
             lme_rate=0.0,   # chain rows carry no LME
             rate=_float(ws.cell(row=r, column=8)),
             value=_float(ws.cell(row=r, column=9)),
+            source_row=r,
         )
         if line.rm_code:
             lines.append(line)
@@ -283,6 +287,7 @@ def _parse_findings(ws: Worksheet) -> list[FindingLine]:
             qty=_float(ws.cell(row=r, column=5)),
             rate=_float(ws.cell(row=r, column=6)),
             value=_float(ws.cell(row=r, column=7)),
+            source_row=r,
         )
         if line.pointer:
             lines.append(line)

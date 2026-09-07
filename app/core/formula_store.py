@@ -76,6 +76,11 @@ SEED_DEFAULTS: dict[str, FormulaDef] = {
         expression="max(LabRt_rate * qty, LabRt_min)",
         notes="Stone setting = SET rate (LabRt LrMCd='SET') × number of stones set, floored at the minimum charge.",
     ),
+    "chain": FormulaDef(
+        component="chain",
+        expression="RmRt_rate * qty",
+        notes="Chain & accessories = RmRt RM-type rate (gold-band) × qty (per piece). Edit to '* weight' for weight-based chain.",
+    ),
 }
 
 # Old labour seed expressions (pre-minimum). Untouched defaults matching these

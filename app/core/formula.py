@@ -39,6 +39,7 @@ COMPONENTS = [
     "labour_w",
     "cdw",
     "setting",
+    "chain",
 ]
 
 COMPONENT_LABELS = {
@@ -50,6 +51,7 @@ COMPONENT_LABELS = {
     "labour_w": "Labour (per gram)",
     "cdw": "CDW (per diamond ct)",
     "setting": "Stone setting",
+    "chain": "Chain & accessories",
 }
 
 

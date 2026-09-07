@@ -1,6 +1,9 @@
-from PySide6.QtWidgets import QTableWidget, QTableWidgetItem, QHeaderView
+from PySide6.QtWidgets import (
+    QTableWidget, QTableWidgetItem, QHeaderView,
+    QStyledItemDelegate, QStyleOptionViewItem, QStyle,
+)
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QBrush, QFont
+from PySide6.QtGui import QColor, QBrush, QFont, QPen
 
 from app.core.comparator import ComparisonRow
 
@@ -21,9 +24,37 @@ TEXT_COLORS = {
 }
 
 
+class _StatusSelectDelegate(QStyledItemDelegate):
+    """
+    Paints rows so a SELECTED row keeps its status colour (green/red/…) instead
+    of being covered by the solid selection fill. We draw the item normally with
+    the Selected flag cleared, then overlay a light translucent tint plus a thin
+    top/bottom border to mark the selection without hiding the colour.
+    """
+    _TINT = QColor(30, 41, 59, 40)      # slate, ~16% — darkens slightly, keeps hue
+    _BORDER = QColor("#6366f1")         # indigo selection marker
+
+    def paint(self, painter, option, index):
+        opt = QStyleOptionViewItem(option)
+        selected = bool(opt.state & QStyle.StateFlag.State_Selected)
+        opt.state &= ~QStyle.StateFlag.State_Selected  # never paint the solid highlight
+        super().paint(painter, opt, index)
+        if selected:
+            r = option.rect
+            painter.save()
+            painter.fillRect(r, self._TINT)
+            pen = QPen(self._BORDER)
+            pen.setWidth(2)
+            painter.setPen(pen)
+            painter.drawLine(r.topLeft(), r.topRight())
+            painter.drawLine(r.bottomLeft(), r.bottomRight())
+            painter.restore()
+
+
 class ComparisonTable(QTableWidget):
     def __init__(self, parent=None):
         super().__init__(0, len(HEADERS), parent)
+        self.setItemDelegate(_StatusSelectDelegate(self))
         self.setHorizontalHeaderLabels(HEADERS)
         self.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)

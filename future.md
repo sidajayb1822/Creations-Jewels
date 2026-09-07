@@ -87,3 +87,65 @@ between match and mismatch/N/A. Which account is authoritative depends on the or
 
 **Reference:** `find_company_code` (`app/core/db.py`), `CustMst` (`CmCd`, `CmName`,
 `CmLkUpRmRt`, `CmLkUpLabRt`), `OrdRm` / `OrdLab` (what the quote actually used).
+
+---
+
+## 3. Chain / accessory rate — quoted value is ~3× the stored rate (source rule unknown)
+
+**Status:** deeply investigated, NOT explained by any readable table. Do NOT assume chain
+lines will auto-match on live data. Needs one question to the client before trusting them.
+
+**What it is**
+Chain & accessory lines (category `X` raw materials — post backs, nuts, hang tags) are quoted
+by Emperor at a value that is roughly **3× the rate stored in the master rate chart**, and that
+multiplier is **not found anywhere in the database**.
+
+**Anchor design:** `SO-26-REG-225-1.xlsx` → `ER25164-(6)` (customer ADINA / `9ADNAPRC`),
+metal G14 @ LME 4076. Chain lines (value = rate × qty, Q basis — confirmed from sheet formula):
+
+| Code | Ctg/Sub | Qty | Wt | Quote rate | Quote value |
+|------|---------|-----|-----|-----------|-------------|
+| `14KYDBNOCPST` | X/PST (post) | 2 | 0.112 | **5.014** | 10.028 |
+| `14KYPSBKZ` | X/NUT (nut) | 2 | 0.162 | **7.779** | 15.558 |
+| `14Y14+1+1` | X/CHN (tag) | 1 | 1.14 | **113.106** | 113.106 |
+
+**Where the rate actually lives (corrects an earlier wrong assumption)**
+- Accessories are **NOT priced per-customer.** `9ADNAPRC` has 1,578 `RmRt` rows but **zero**
+  category-X rows. The customer chart deliberately holds no accessory rates.
+- They price from **`ZSELF`** — the manufacturer's own house company (7,646 category-X rows).
+  The app's `base_company_code = ZSELF` fallback is therefore the *correct* source. (Old
+  `OrdRm` rows confirm the lookup company is the house code, not the customer — `OrCoCd = ZZZ`.)
+- `RmMst.RmPurityRt = 0.0` for all three, so Emperor does **not** cost them as gold-by-weight;
+  the weight column is informational. Value is purely `rate × qty`.
+
+**Why it does NOT reproduce, even on current data**
+- Stored `ZSELF` rates: `14KYDBNOCPST` = **1.63**, `14KYPSBKZ` = **2.55**, `14Y14+1+1` = **42.05**.
+- Quote used 5.014 / 7.779 / 113.106 → ratios **3.08 / 3.05 / 2.69** (the two small parts ~3.06,
+  the tag 2.69 — not a single clean factor).
+- The exact quoted rates (5.014 etc.) appear in **no** table: not `RmRt`, `RmRtHist`, `OrdRm`,
+  or `MultiPrcQtRm`. The ~3× uplift is applied inside Emperor's pricing engine at quote time.
+- Not gold-by-weight (implied per-gram 89.5 / 96.0 / 99.2 — all differ, all above the 85.6/g
+  base gold rate; purity is 0 anyway). Not a base-chart scale (ratios inconsistent). Not a
+  customer multiplier (`CmMulBy = 1.0`).
+
+**The "stale backup" theory was ruled out (important)**
+- Quote date **2026-06-30**; DB backup/restore **2026-06-27** (backup is 3 days older).
+- BUT the `ZSELF` accessory rates were last changed **2025-09/10** (`ModDt` 2025-10-09 /
+  2025-09-19) — stable ~8 months, unchanged in that 3-day window. So the backup holds the SAME
+  rate (1.63) the quote would have read. The 3-day gap does **not** explain the 3× difference.
+
+**Consequence for the app**
+Current chain formula `RmRt_rate * qty` gives 1.63 × 2 = **3.26**; the quote is **10.028**.
+So chain lines will show a large mismatch **even on fully current live data** until the ~3×
+rule is known. The app's *source* (ZSELF) is right; the *transform* is missing.
+
+**Next step (client question, before any code change)**
+Ask: "For chain / accessory (category X) parts, how does Emperor get from the stored rate
+(e.g. 1.63) to the quoted rate (5.014)? Is there a gold multiplier or markup applied at quote
+time?" Their rule → a small formula change (a `chain` component multiplier / gold factor).
+
+**Reference tables:** `RmRt` (RrCd, RrCmCd, RrCtg='X', RrFrLn/RrToLn gold band, RrSalRt,
+ModDt), `RmMst` (RmPurityRt=0 for these), `OrdRm` (OrCoCd=ZZZ house company, historical
+OrSalRt ~2.0), `RmRtHist` (no rows for these codes), `MultiPrcQtRm` (quote RM — no rows in
+this restore). App: `get_chain_rates` (`app/core/db.py`), chain loop + `_fill_from_base`
+(`app/core/comparator.py`), `SEED_DEFAULTS["chain"]` (`app/core/formula_store.py`).

@@ -51,7 +51,8 @@ class _Worker(QObject):
                 rows = compare(d, db, company_code=company_code, loss_pct=loss_pct,
                                base_company_code=base_company_code)
                 stats = summary_stats(rows, multiplier=multiplier)
-                results.append({"label": d.design_label, "rows": rows, "stats": stats})
+                results.append({"label": d.design_label, "sheet": d.sheet_name,
+                                "rows": rows, "stats": stats})
 
             order_no = docs[0].header.order_no if docs else ""
             order_info = (
@@ -74,6 +75,7 @@ class _DesignComparePanel(QWidget):
         super().__init__(parent)
         self._rows: list[ComparisonRow] = []
         self._on_edit_formula = on_edit_formula
+        self.sheet_name: str = ""
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 8, 0, 0)
@@ -201,7 +203,7 @@ class BOMCompareWidget(QWidget):
         layout.addWidget(self.tabs, 1)
 
         btn_row = QHBoxLayout()
-        self.export_btn = QPushButton("Export Active Design to Excel")
+        self.export_btn = QPushButton("Export Highlighted Excel")
         self.export_btn.setEnabled(False)
         self.export_btn.clicked.connect(self._export)
         btn_row.addStretch()
@@ -236,6 +238,7 @@ class BOMCompareWidget(QWidget):
         diff_designs = 0
         for res in results:
             panel = _DesignComparePanel(on_edit_formula=self._reload)
+            panel.sheet_name = res.get("sheet", "")
             panel.load(res["rows"], res["stats"])
             idx = self.tabs.addTab(panel, res["label"])
 
@@ -300,26 +303,29 @@ class BOMCompareWidget(QWidget):
             self._on_file(self._last_path)
 
     def _export(self):
-        # Gather every design tab so a multi-BOM file exports as one workbook,
-        # one sheet per design.
+        # Export = a copy of the uploaded file with each design's rows filled by
+        # their status colour; everything else in the workbook is left untouched.
+        if not self._last_path:
+            return
         designs: list[tuple[str, list[ComparisonRow]]] = []
         for i in range(self.tabs.count()):
             panel = self.tabs.widget(i)
-            if isinstance(panel, _DesignComparePanel) and panel.rows():
-                designs.append((self.tabs.tabText(i), panel.rows()))
+            if isinstance(panel, _DesignComparePanel) and panel.sheet_name and panel.rows():
+                designs.append((panel.sheet_name, panel.rows()))
         if not designs:
             return
-        default_name = (f"{designs[0][0]}-comparison.xlsx" if len(designs) == 1
-                        else "order-comparison.xlsx")
+        stem = os.path.splitext(os.path.basename(self._last_path))[0]
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Comparison", default_name, "Excel Files (*.xlsx)"
+            self, "Save Highlighted Excel", f"{stem}-highlighted.xlsx",
+            "Excel Files (*.xlsx)"
         )
         if not path:
             return
         try:
-            _export_to_excel(designs, path)
-            sheets = "1 sheet" if len(designs) == 1 else f"{len(designs)} sheets"
-            QMessageBox.information(self, "Exported", f"Saved {sheets} to:\n{path}")
+            n = _export_highlighted(self._last_path, designs, path)
+            QMessageBox.information(
+                self, "Exported",
+                f"Highlighted {n} design sheet(s) — original layout preserved:\n{path}")
         except Exception as e:
             QMessageBox.critical(self, "Export Error", str(e))
 
@@ -335,71 +341,43 @@ _STATUS_FILLS = {
     "missing": "FFe2e3e5",
 }
 
-
-_EXPORT_HEADERS = ["Section", "Code", "Description",
-                   "Template ($)", "Master ($)", "Diff ($)", "Diff (%)"]
-
-
-def _safe_sheet_name(name: str, used: set) -> str:
-    """Excel sheet names: <=31 chars, none of []:*?/\\, and unique."""
-    clean = "".join("_" if c in r"[]:*?/\\" else c for c in (name or "Design"))[:31]
-    clean = clean.strip() or "Design"
-    base, n = clean, 2
-    while clean.lower() in used:
-        suffix = f"_{n}"
-        clean = base[:31 - len(suffix)] + suffix
-        n += 1
-    used.add(clean.lower())
-    return clean
+# When several comparison lines map to one Excel row (a stone + its setting),
+# the row takes the most severe status.
+_STATUS_SEVERITY = {"match": 0, "missing": 1, "minor": 2, "major": 3}
 
 
-def _write_design_sheet(ws, rows: list[ComparisonRow]):
-    from openpyxl.styles import PatternFill, Font, Alignment
+def _export_highlighted(src_path: str,
+                        designs: list[tuple[str, list[ComparisonRow]]],
+                        out_path: str) -> int:
+    """
+    Save a copy of the uploaded workbook (`src_path`) to `out_path`, unchanged
+    except that each design sheet's data rows are filled with their status
+    colour. `designs` is [(sheet_name, rows), ...]. Returns the number of sheets
+    coloured. Non-design sheets and header rows are left exactly as they were.
+    """
+    from openpyxl import load_workbook
+    from openpyxl.styles import PatternFill
 
-    ws.append(_EXPORT_HEADERS)
-    hdr_font = Font(bold=True, color="FFFFFFFF")
-    hdr_fill = PatternFill("solid", fgColor="FF3949AB")
-    for cell in ws[1]:
-        cell.font = hdr_font
-        cell.fill = hdr_fill
-        cell.alignment = Alignment(horizontal="center")
-
-    for row in rows:
-        desc = row.description
-        if getattr(row, "source_note", ""):
-            desc = f"{desc} ({row.source_note})".strip()
-        ws.append([
-            row.section,
-            row.code,
-            desc,
-            row.template_value,
-            row.master_value if row.master_value is not None else "N/A",
-            row.diff_dollar if row.master_value is not None else None,
-            row.diff_pct / 100 if row.master_value is not None else None,
-        ])
-        fill = PatternFill("solid", fgColor=_STATUS_FILLS.get(row.status, "FFFFFFFF"))
-        for cell in ws[ws.max_row]:
-            cell.fill = fill
-
-    for col, width in enumerate([18, 18, 40, 14, 14, 12, 12], start=1):
-        ws.column_dimensions[ws.cell(1, col).column_letter].width = width
-
-    for row in ws.iter_rows(min_row=2):
-        for c_idx in [3, 4, 5]:
-            row[c_idx].number_format = '#,##0.00'
-        row[6].number_format = '+0.0%;-0.0%;0.0%'
-
-
-def _export_to_excel(designs: list[tuple[str, list[ComparisonRow]]], path: str):
-    """Write one sheet per design into a single workbook."""
-    from openpyxl import Workbook
-
-    wb = Workbook()
-    wb.remove(wb.active)   # drop the default empty sheet
-    used: set = set()
-    for name, rows in designs:
-        ws = wb.create_sheet(_safe_sheet_name(name, used))
-        _write_design_sheet(ws, rows)
-    if not wb.sheetnames:      # safety: never save an empty workbook
-        _write_design_sheet(wb.create_sheet("BOM Comparison"), [])
-    wb.save(path)
+    wb = load_workbook(src_path)   # no data_only → values/formulas/styles preserved
+    coloured = 0
+    for sheet_name, rows in designs:
+        if sheet_name not in wb.sheetnames:
+            continue
+        ws = wb[sheet_name]
+        # Worst status per physical Excel row.
+        worst: dict[int, str] = {}
+        for row in rows:
+            sr = getattr(row, "source_row", 0)
+            if not sr:
+                continue
+            cur = worst.get(sr)
+            if cur is None or _STATUS_SEVERITY.get(row.status, 0) > _STATUS_SEVERITY.get(cur, 0):
+                worst[sr] = row.status
+        max_col = ws.max_column
+        for row_idx, status in worst.items():
+            fill = PatternFill("solid", fgColor=_STATUS_FILLS.get(status, "FFFFFFFF"))
+            for col in range(1, max_col + 1):
+                ws.cell(row=row_idx, column=col).fill = fill
+        coloured += 1
+    wb.save(out_path)
+    return coloured
