@@ -23,6 +23,44 @@ from typing import Optional
 _IDENT_RE = re.compile(r"^[A-Za-z0-9_]+$")
 _SAFE_OPS = {"=", "<=", ">=", "<", ">"}
 
+# ---------------------------------------------------------------------------
+# Order/quote number parsing (e.g. "CJE/26/SO/REG/225" or "CJE\QT\26\PRC\4\1")
+# into Emperor's (Tc, Yy, Chr, No) header key, used to look up the per-order
+# metal rates. Verified against real examples: an order prints as
+# prefix/Yy/Tc/Chr/No, a still-open quote prints as prefix\Tc\Yy\Chr\No\index
+# (Emperor's own report templates order the tokens differently for the two
+# document types). The 2-digit year token is the anchor: whichever neighbour
+# is alphabetic is Tc; whatever remains, in order, is Chr then No — any
+# further trailing token (a quote's line-item index) is ignored.
+# ---------------------------------------------------------------------------
+_ORDER_NO_SPLIT_RE = re.compile(r"[\\/]+")
+_YY_RE = re.compile(r"^\d{2}$")
+
+
+def _parse_order_no(order_no: str) -> Optional[tuple[str, str, str, str]]:
+    """Parse an order/quote number into (Tc, Yy, Chr, No), or None if the
+    shape isn't recognized. This is a heuristic based on real examples, not
+    an exhaustive spec of every Emperor number format."""
+    if not order_no:
+        return None
+    tokens = [t for t in _ORDER_NO_SPLIT_RE.split(order_no.strip()) if t]
+    if len(tokens) < 5:
+        return None
+    tokens = tokens[1:]  # drop the leading company prefix (e.g. "CJE")
+    yy_idx = next((i for i, t in enumerate(tokens) if _YY_RE.match(t)), None)
+    if yy_idx is None:
+        return None
+    yy = tokens[yy_idx]
+    if yy_idx > 0 and tokens[yy_idx - 1].isalpha():
+        tc, rest = tokens[yy_idx - 1], tokens[:yy_idx - 1] + tokens[yy_idx + 1:]
+    elif yy_idx + 1 < len(tokens) and tokens[yy_idx + 1].isalpha():
+        tc, rest = tokens[yy_idx + 1], tokens[:yy_idx] + tokens[yy_idx + 2:]
+    else:
+        return None
+    if len(rest) < 2:
+        return None
+    return (tc.upper(), yy, rest[0].upper(), rest[1])
+
 try:
     import pyodbc
     PYODBC_AVAILABLE = True
@@ -109,6 +147,11 @@ class DBConnection:
         # setting rate is fetched once per code, not once per stone (read-only DB
         # → safe to cache for the session).
         self._setting_band_cache: dict = {}
+        # Per-order-number metal-rate header lookups (see get_order_metal_rates),
+        # and the DB-wide "most recent" fallback used when an order/quote isn't
+        # found (e.g. it postdates a restored test backup).
+        self._order_rate_cache: dict = {}
+        self._latest_rate_cache: Optional[dict] = None
 
     def connect(self, config: Optional[dict] = None) -> None:
         if not PYODBC_AVAILABLE:
@@ -116,6 +159,8 @@ class DBConnection:
         cfg = config or load_config()
         self._config = cfg
         self._setting_band_cache = {}
+        self._order_rate_cache = {}
+        self._latest_rate_cache = None
         conn_str = build_connection_string(cfg)
         conn = pyodbc.connect(conn_str, autocommit=True)
         # Per-query timeout so a slow query aborts with an error instead of
@@ -147,6 +192,8 @@ class DBConnection:
         """Drop any cached rate data so the next lookup re-queries Emperor.
         Used by the Refresh button to pick up rate changes without reconnecting."""
         self._setting_band_cache = {}
+        self._order_rate_cache = {}
+        self._latest_rate_cache = None
 
     def disconnect(self) -> None:
         if self._conn:
@@ -227,32 +274,127 @@ class DBConnection:
         return result
 
     # ------------------------------------------------------------------
-    # Chain & accessories rate (RmRt RM-type, banded by the gold price)
-    # These are RmCtg='X' accessory codes charged per piece; the RM rate row
-    # is selected by the band that contains the design's LME (gold $/oz).
+    # Per-order/quote metal rates (OrdMst / MultiPrcQtMst headers)
+    # Emperor captures Gold/Platinum/Silver/4th-category spot rates once per
+    # order or open quote, independent of which metal the design's own BOM
+    # body uses — a gold accessory in a silver ring still prices off the
+    # order's own gold rate, not the ring's silver rate.
+    # ------------------------------------------------------------------
+    _ORD_RATE_COLS = {"G": "OmLmgSal", "P": "OmLmpSal", "S": "OmLmsSal", "L": "OmLmlSal"}
+    _QT_RATE_COLS = {"G": "MqmLmgSal", "P": "MqmLmpSal", "S": "MqmLmsSal", "L": "MqmLmlSal"}
+
+    def get_order_metal_rates(self, order_no: str) -> tuple[dict[str, float], bool]:
+        """
+        Returns ({"G":gold, "P":platinum, "S":silver, "L":4th}, used_estimate).
+
+        Looks up the order header (OrdMst) first, then the open-quote header
+        (MultiPrcQtMst) by the same key, using `order_no` parsed via
+        `_parse_order_no`. When neither has this exact order/quote (e.g. it
+        postdates a restored test backup), falls back to the most recent
+        header rates found anywhere in the DB and reports used_estimate=True.
+        """
+        cache_key = (order_no or "").strip()
+        if cache_key in self._order_rate_cache:
+            return self._order_rate_cache[cache_key]
+
+        result = None
+        parsed = _parse_order_no(order_no) if order_no else None
+        if parsed:
+            tc, yy, chr_, no = parsed
+            try:
+                rows = self._execute(
+                    "SELECT OmLmgSal, OmLmpSal, OmLmsSal, OmLmlSal FROM OrdMst "
+                    "WHERE OmTc=? AND OmYy=? AND OmChr=? AND OmNo=?",
+                    (tc, yy, chr_, no),
+                )
+                if rows:
+                    r = rows[0]
+                    result = {k: float(r[c] or 0) for k, c in self._ORD_RATE_COLS.items()}
+            except Exception:
+                pass
+            if result is None:
+                try:
+                    rows = self._execute(
+                        "SELECT MqmLmgSal, MqmLmpSal, MqmLmsSal, MqmLmlSal FROM MultiPrcQtMst "
+                        "WHERE MqmTc=? AND MqmYy=? AND MqmChr=? AND MqmNo=?",
+                        (tc, yy, chr_, no),
+                    )
+                    if rows:
+                        r = rows[0]
+                        result = {k: float(r[c] or 0) for k, c in self._QT_RATE_COLS.items()}
+                except Exception:
+                    pass
+
+        used_estimate = result is None
+        if result is None:
+            result = self._latest_known_metal_rates()
+
+        out = (result, used_estimate)
+        self._order_rate_cache[cache_key] = out
+        return out
+
+    def _latest_known_metal_rates(self) -> dict[str, float]:
+        """Most recent order-header metal rates anywhere in the DB — the best
+        available estimate when a specific order/quote can't be found."""
+        if self._latest_rate_cache is not None:
+            return self._latest_rate_cache
+        result = {"G": 0.0, "P": 0.0, "S": 0.0, "L": 0.0}
+        try:
+            rows = self._execute(
+                "SELECT TOP 1 OmLmgSal, OmLmpSal, OmLmsSal, OmLmlSal FROM OrdMst "
+                "ORDER BY OmDt DESC"
+            )
+            if rows:
+                r = rows[0]
+                result = {k: float(r[c] or 0) for k, c in self._ORD_RATE_COLS.items()}
+        except Exception:
+            pass
+        self._latest_rate_cache = result
+        return result
+
+    # ------------------------------------------------------------------
+    # Chain & accessories rate (RmRt RM-type, banded by metal price)
+    # These are accessory codes (category X, or G/P/S findings) charged per
+    # piece; the RM rate row is selected by the band that contains the
+    # rate of whichever metal the code itself belongs to.
     # ------------------------------------------------------------------
     def get_chain_rates(self, rm_codes: list[str], company_code: str,
-                        lme: float = 0.0) -> dict[str, float]:
-        """Returns {rm_code: rate} for chain/accessory (category-X) codes.
+                        order_no: str = "", design_lme: float = 0.0
+                        ) -> tuple[dict[str, float], bool]:
+        """Returns ({rm_code: rate}, used_estimated_header_rate).
 
-        Emperor prices these by interpolating within a gold-price band:
+        Emperor prices these by interpolating within a metal-price band:
             rate = RrSalRt + (LME - RrFrLn) * increment
-        where the per-code increment is stored in RmRt.RrFixMinTol (the sale-rate
-        increment per $/oz above the band floor; = RrFixMaxTol). When the increment
-        is 0 the rate is simply RrSalRt for the band whose RrFrLn..RrToLn contains
-        the LME (fixed rate decided in the band). The band is picked as the one
-        containing `lme`, else the widest; `lme` is clamped into the band so the
-        rate never extrapolates past RrToLn. Verified against the client's
-        ZSELF chart (e.g. 14KYDBNOCPST: 1.63 + (4076-1000)*0.0011 = 5.014)."""
+        where the per-code increment is stored in RmRt.RrFixMinTol (=
+        RrFixMaxTol), and LME is the rate of whichever METAL the code itself
+        belongs to (RmRt.RrCtg: G=gold, P=platinum, S=silver) — NOT the
+        design's own body metal. That per-category rate is captured once per
+        order/quote header and looked up via `get_order_metal_rates(order_no)`.
+        Verified against the client's ZSELF chart (14KYDBNOCPST:
+        1.63 + (4076-1000)*0.0011 = 5.014, gold LME=4076).
+
+        Category 'X' (generic accessory — chain/post/nut codes) has no direct
+        G/P/S tag of its own in RrCtg; every such code seen from this client
+        is a gold-content part (name-prefixed "14KY"/"10KT" etc.), so it
+        defaults to the gold rate. Revisit this default if a non-gold 'X'
+        code appears. `design_lme` (the design's own metal rate) is only used
+        as a last-resort fallback if the order-header rate for a code's
+        category is unavailable (0/missing).
+
+        Band selection: the row whose RrFrLn..RrToLn contains the resolved
+        LME, else the row whose NEAREST EDGE is closest to it — not the
+        widest, which ties arbitrarily among same-width bands.
+        """
         if not rm_codes or not company_code:
-            return {}
+            return {}, False
+        order_rates, used_estimate = self.get_order_metal_rates(order_no)
         result: dict[str, float] = {}
         for code in rm_codes:
             if not code:
                 continue
             try:
                 rows = self._execute(
-                    "SELECT RrFrLn, RrToLn, RrSalRt, RrFixMinTol FROM RmRt "
+                    "SELECT RrCtg, RrFrLn, RrToLn, RrSalRt, RrFixMinTol FROM RmRt "
                     "WHERE RrCd=? AND RrCmCd=? AND RrTcTyp='RM'",
                     (code, company_code),
                 )
@@ -260,12 +402,15 @@ class DBConnection:
                 continue
             if not rows:
                 continue
+            category = next((r["RrCtg"] for r in rows if r["RrCtg"] in ("G", "P", "S", "L")), "G")
+            lme = order_rates.get(category) or design_lme
             best, best_key = None, None
             for r in rows:
                 fr, to = float(r["RrFrLn"] or 0), float(r["RrToLn"] or 0)
                 contains = fr <= lme <= to
-                # containing band first; among the rest, the widest range.
-                key = (0 if contains else 1, -(to - fr))
+                dist = 0.0 if contains else min(abs(lme - fr), abs(lme - to))
+                # containing band first; among the rest, the CLOSEST band.
+                key = (0 if contains else 1, dist)
                 if best_key is None or key < best_key:
                     best, best_key = r, key
             if best is not None:
@@ -277,7 +422,7 @@ class DBConnection:
                 # collapses this to the flat band rate (base).
                 eff = min(max(lme, fr), to) if to > fr else lme
                 result[code] = base + (eff - fr) * inc
-        return result
+        return result, used_estimate
 
     # ------------------------------------------------------------------
     # Metal purity  (RmMst.RmPurityRt)

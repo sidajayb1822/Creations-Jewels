@@ -398,15 +398,19 @@ def compare(doc: BOMDocument, db: DBConnection,
                              source_row=l.source_row))
 
     # ---- Chain & Accessories ----
-    # Accessory RM codes (RmCtg='X') charged per piece; master rate is the RmRt
-    # RM-type row banded by the design's gold price (LME). Value = rate × basis.
+    # Accessory RM codes charged per piece; master rate is the RmRt RM-type
+    # row banded by the rate of whichever metal the code itself belongs to
+    # (looked up from the order/quote header, not the design's own body
+    # metal — see get_chain_rates). Value = rate × basis.
     if doc.chain:
         chain_codes = list({ch.rm_code for ch in doc.chain if ch.rm_code})
-        lme = max((m.lme_rate for m in doc.metals), default=0.0)
-        chain_rates = db.get_chain_rates(chain_codes, company_code, lme)
+        design_lme = max((m.lme_rate for m in doc.metals), default=0.0)
+        order_no = doc.header.order_no
+        chain_rates, chain_estimated = db.get_chain_rates(
+            chain_codes, company_code, order_no, design_lme)
         chain_rates, chain_base_keys = _fill_from_base(
             chain_rates,
-            lambda missing, cc: db.get_chain_rates(missing, cc, lme),
+            lambda missing, cc: db.get_chain_rates(missing, cc, order_no, design_lme)[0],
             chain_codes, base_company_code)
         for ch in doc.chain:
             if not ch.rm_code:
@@ -418,6 +422,8 @@ def compare(doc: BOMDocument, db: DBConnection,
                 ctx["RmRt_rate"] = chain_rates[ch.rm_code]
                 if ch.rm_code in chain_base_keys:
                     note = "base chart"
+                if chain_estimated:
+                    note = (note + "; " if note else "") + "estimated gold rate"
             master_val, trace = _eval_component("chain", company_code, ctx)
             desc = rm_descriptions.get(ch.rm_code) or f"{ch.category} {ch.sub_category}".strip()
             rows.append(_row("Chain", ch.rm_code, desc, ch.value,
