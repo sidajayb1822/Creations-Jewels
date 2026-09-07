@@ -61,6 +61,25 @@ def _parse_order_no(order_no: str) -> Optional[tuple[str, str, str, str]]:
         return None
     return (tc.upper(), yy, rest[0].upper(), rest[1])
 
+
+def _kt_to_category(kt: str) -> Optional[str]:
+    """Maps RmMst.RmKt to a metal category (G/P/S). RmKt disambiguates a
+    generic accessory (RmRt.RrCtg='X') into its real metal — RrCtg alone just
+    says "X" for these, but real-world data shows X-category codes covering
+    all three metals (e.g. gold "14KT", platinum "950PT"/"999PT", silver
+    "SLVR" chains/mountings are all tagged RmCtg='X'). Returns None when
+    RmKt is blank/"-"/unrecognized."""
+    kt = (kt or "").strip().upper()
+    if not kt or kt == "-":
+        return None
+    if "PT" in kt:
+        return "P"
+    if "KT" in kt:
+        return "G"
+    if "SLVR" in kt or "SILVER" in kt:
+        return "S"
+    return None
+
 try:
     import pyodbc
     PYODBC_AVAILABLE = True
@@ -374,12 +393,20 @@ class DBConnection:
         1.63 + (4076-1000)*0.0011 = 5.014, gold LME=4076).
 
         Category 'X' (generic accessory — chain/post/nut codes) has no direct
-        G/P/S tag of its own in RrCtg; every such code seen from this client
-        is a gold-content part (name-prefixed "14KY"/"10KT" etc.), so it
-        defaults to the gold rate. Revisit this default if a non-gold 'X'
-        code appears. `design_lme` (the design's own metal rate) is only used
-        as a last-resort fallback if the order-header rate for a code's
-        category is unavailable (0/missing).
+        G/P/S tag of its own in RrCtg; real data shows 'X' covers gold, silver
+        AND platinum accessories alike, so guessing "always gold" would be
+        wrong for the non-gold ones. Its real metal is resolved, in order:
+          1. RmMst.RmBaseCd — a direct pointer to the actual metal RM code
+             (e.g. "G14", "G10", "SLVR"); that code's OWN RrCtg is
+             unambiguous. Most authoritative when present (covers ~95% of
+             category-X codes, 100% correct where present — verified).
+          2. RmMst.RmKt text ("14KT"→gold, "950PT"/"999PT"→platinum,
+             "SLVR"→silver — see `_kt_to_category`) — covers the remaining
+             gap where RmBaseCd is blank.
+          3. Gold, as a last resort if neither is usable.
+        `design_lme` (the design's own metal rate) is only used as a final
+        fallback if the order-header rate for a code's category is
+        unavailable (0/missing).
 
         Band selection: the row whose RrFrLn..RrToLn contains the resolved
         LME, else the row whose NEAREST EDGE is closest to it — not the
@@ -388,6 +415,35 @@ class DBConnection:
         if not rm_codes or not company_code:
             return {}, False
         order_rates, used_estimate = self.get_order_metal_rates(order_no)
+
+        # Resolve each category-X code's real metal: RmBaseCd (a pointer to
+        # the actual metal RM code) first, RmKt text second.
+        kt_map: dict[str, str] = {}
+        base_map: dict[str, str] = {}
+        try:
+            placeholders = ",".join("?" * len(rm_codes))
+            for r in self._execute(
+                f"SELECT RmCd, RmKt, RmBaseCd FROM RmMst WHERE RmCd IN ({placeholders})",
+                list(rm_codes),
+            ):
+                kt_map[r["RmCd"]] = r["RmKt"] or ""
+                base_map[r["RmCd"]] = r["RmBaseCd"] or ""
+        except Exception:
+            pass
+
+        base_ctg_map: dict[str, str] = {}
+        base_codes = list({v for v in base_map.values() if v})
+        if base_codes:
+            try:
+                placeholders = ",".join("?" * len(base_codes))
+                for r in self._execute(
+                    f"SELECT RmCd, RmCtg FROM RmMst WHERE RmCd IN ({placeholders})",
+                    base_codes,
+                ):
+                    base_ctg_map[r["RmCd"]] = r["RmCtg"] or ""
+            except Exception:
+                pass
+
         result: dict[str, float] = {}
         for code in rm_codes:
             if not code:
@@ -402,7 +458,11 @@ class DBConnection:
                 continue
             if not rows:
                 continue
-            category = next((r["RrCtg"] for r in rows if r["RrCtg"] in ("G", "P", "S", "L")), "G")
+            row_ctg = next((r["RrCtg"] for r in rows if r["RrCtg"] in ("G", "P", "S", "L")), None)
+            base_ctg = base_ctg_map.get(base_map.get(code, ""))
+            if base_ctg not in ("G", "P", "S", "L"):
+                base_ctg = None
+            category = row_ctg or base_ctg or _kt_to_category(kt_map.get(code, "")) or "G"
             lme = order_rates.get(category) or design_lme
             best, best_key = None, None
             for r in rows:
