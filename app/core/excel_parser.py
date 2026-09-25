@@ -54,6 +54,17 @@ def _str(cell) -> str:
     return "" if v is None else str(v)
 
 
+def _rm_code(cell) -> str:
+    """RM Code cells: some print templates wrap the code in curly braces
+    (e.g. "{14KYBOX18IN}" — the same convention Emperor uses for the "Cust
+    Design" reference field). The database's own RmCd is always plain, so
+    strip the braces here or every lookup for that line comes back N/A."""
+    v = _str(cell).strip()
+    if v.startswith("{") and v.endswith("}"):
+        v = v[1:-1].strip()
+    return v
+
+
 def _find_section_row(ws: Worksheet, keyword: str, max_row: int = 120) -> Optional[int]:
     """Return the row where col-1 starts with or contains keyword (case-insensitive)."""
     kw = keyword.upper().strip()
@@ -125,7 +136,7 @@ def _parse_metals(ws: Worksheet) -> list[MetalLine]:
             sr=sr,
             category=_str(ws.cell(row=r, column=2)),
             sub_category=_str(ws.cell(row=r, column=3)),
-            rm_code=_str(ws.cell(row=r, column=4)),
+            rm_code=_rm_code(ws.cell(row=r, column=4)),
             qty=_float(ws.cell(row=r, column=5)),
             weight=_float(ws.cell(row=r, column=6)),
             calc_mode=_str(ws.cell(row=r, column=7)) or "W",
@@ -163,7 +174,7 @@ def _parse_stones(ws: Worksheet) -> list[StoneLine]:
         line = StoneLine(
             sr=sr,
             shape=_str(ws.cell(row=r, column=3)),           # Sub Ctg = OVL / TAP / etc.
-            rm_code=_str(ws.cell(row=r, column=4)),         # RM Code = stone lookup code
+            rm_code=_rm_code(ws.cell(row=r, column=4)),     # RM Code = stone lookup code
             set_code=_str(ws.cell(row=r, column=12)),       # Setting code
             description=_str(ws.cell(row=r, column=2)),     # Category D/C
             qty=_float(ws.cell(row=r, column=7)),
@@ -243,7 +254,7 @@ def _parse_chain(ws: Worksheet) -> list[MetalLine]:
             sr=sr,
             category=_str(ws.cell(row=r, column=2)),
             sub_category=_str(ws.cell(row=r, column=3)),
-            rm_code=_str(ws.cell(row=r, column=4)),
+            rm_code=_rm_code(ws.cell(row=r, column=4)),
             qty=_float(ws.cell(row=r, column=5)),
             weight=_float(ws.cell(row=r, column=6)),
             calc_mode=_str(ws.cell(row=r, column=7)) or "W",
