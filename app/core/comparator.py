@@ -30,7 +30,9 @@ from app.core.custom_var import custom_var_store
 
 MINOR_THRESHOLD = 5.0    # yellow
 MAJOR_THRESHOLD = 15.0   # red
-MIN_COMPARE_VALUE = 1.0  # lines below this $ value are always "match" (avoids float noise on $0 items)
+MIN_COMPARE_VALUE = 1.0  # both values below this $ amount are candidates for the noise-skip below
+MIN_DIFF_DOLLAR = 0.05   # ...but only skipped if the actual $ gap is also this small (avoids
+                         # hiding a real mismatch, e.g. $0.60 vs $0.30, just because both are <$1)
 
 # Labour heads charged per carat of diamond rather than per gram of metal.
 # Reference: "CDW = D weight x Lbr Rate".
@@ -112,7 +114,8 @@ def _classify(diff_pct: float, master_value: Optional[float],
               template_value: float = 0.0) -> str:
     if master_value is None:
         return "missing"
-    if abs(template_value) < MIN_COMPARE_VALUE and abs(master_value) < MIN_COMPARE_VALUE:
+    if (abs(template_value) < MIN_COMPARE_VALUE and abs(master_value) < MIN_COMPARE_VALUE
+            and abs(master_value - template_value) < MIN_DIFF_DOLLAR):
         return "match"
     abs_pct = abs(diff_pct)
     if abs_pct <= MINOR_THRESHOLD:
