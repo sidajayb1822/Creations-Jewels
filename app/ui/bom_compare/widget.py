@@ -342,8 +342,24 @@ _STATUS_FILLS = {
 }
 
 # When several comparison lines map to one Excel row (a stone + its setting),
-# the row takes the most severe status.
+# each line only colours its OWN columns, not the whole row — otherwise a
+# setting mismatch would also paint the stone's own (correct) rate/value red,
+# making it impossible to tell which of the two actually changed.
 _STATUS_SEVERITY = {"match": 0, "missing": 1, "minor": 2, "major": 3}
+
+# 1-based, inclusive Excel column ranges per section (see excel_parser.py's
+# column-layout docstring). A stone's own columns (1-11) and its setting's
+# columns (12-14) share one physical row but are coloured independently.
+# Any section not listed here falls back to the whole row (safe default).
+_SECTION_COL_RANGE = {
+    "Metal": (1, 10),
+    "Stone": (1, 11),
+    "Stone Setting": (12, 14),
+    "Labour (Setting)": (1, 7),
+    "Labour (Others)": (1, 7),
+    "Finding": (1, 7),
+    "Chain": (1, 9),
+}
 
 
 def _export_highlighted(src_path: str,
@@ -364,20 +380,24 @@ def _export_highlighted(src_path: str,
         if sheet_name not in wb.sheetnames:
             continue
         ws = wb[sheet_name]
-        # Worst status per physical Excel row.
-        worst: dict[int, str] = {}
+        max_col = ws.max_column
+        # Worst status per (row, column) — so two lines sharing one physical
+        # row (a stone + its setting) are coloured independently, not merged
+        # into a single worst-of-both colour across the whole row.
+        cell_status: dict[tuple[int, int], str] = {}
         for row in rows:
             sr = getattr(row, "source_row", 0)
             if not sr:
                 continue
-            cur = worst.get(sr)
-            if cur is None or _STATUS_SEVERITY.get(row.status, 0) > _STATUS_SEVERITY.get(cur, 0):
-                worst[sr] = row.status
-        max_col = ws.max_column
-        for row_idx, status in worst.items():
+            col_from, col_to = _SECTION_COL_RANGE.get(row.section, (1, max_col))
+            for col in range(col_from, min(col_to, max_col) + 1):
+                key = (sr, col)
+                cur = cell_status.get(key)
+                if cur is None or _STATUS_SEVERITY.get(row.status, 0) > _STATUS_SEVERITY.get(cur, 0):
+                    cell_status[key] = row.status
+        for (row_idx, col), status in cell_status.items():
             fill = PatternFill("solid", fgColor=_STATUS_FILLS.get(status, "FFFFFFFF"))
-            for col in range(1, max_col + 1):
-                ws.cell(row=row_idx, column=col).fill = fill
+            ws.cell(row=row_idx, column=col).fill = fill
         coloured += 1
     wb.save(out_path)
     return coloured
