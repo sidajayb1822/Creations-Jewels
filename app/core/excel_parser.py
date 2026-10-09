@@ -181,6 +181,7 @@ def _parse_stones(ws: Worksheet) -> list[StoneLine]:
             dimension=_str(ws.cell(row=r, column=5)),       # "2.5 PTR" / "8x6" etc.
             pointer_value=_float(ws.cell(row=r, column=6)), # per-stone pointer size
             weight=_float(ws.cell(row=r, column=8)),        # total carat weight
+            calc_mode=_str(ws.cell(row=r, column=9)) or "W",  # Q/W flag
             price=_float(ws.cell(row=r, column=10)),        # rate per carat from BOM
             value=_float(ws.cell(row=r, column=11)),
             sub_code=_str(ws.cell(row=r, column=3)),

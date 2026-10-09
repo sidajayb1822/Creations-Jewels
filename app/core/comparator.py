@@ -328,7 +328,11 @@ def compare(doc: BOMDocument, db: DBConnection,
         master_price = stone_prices.get(key)
         component = "colour_stone" if s.description.strip().upper().startswith("C") else "diamond"
         dim = _stone_lookup_dim(s)
-        ctx = {**base_ctx, "weight": s.weight, "qty": s.qty,
+        # Basis for the rate multiplication: qty for a per-piece-priced line
+        # (Q/W='Q', common for small melee sold at a flat $/stone), else the
+        # total carat weight (Q/W='W', the usual per-carat case).
+        basis = s.qty if (s.calc_mode or "").strip().upper() == "Q" else s.weight
+        ctx = {**base_ctx, "weight": s.weight, "qty": s.qty, "basis": basis,
                "pointer": dim, "line_value": s.value,
                "setting_rate": s.rate_each, "setting_qty": s.qty}
         if master_price is not None:

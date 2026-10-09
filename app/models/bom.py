@@ -42,6 +42,7 @@ class StoneLine:
     dimension: str = ""       # Size string e.g. "2.5 PTR", "8x6" (col 5)
     pointer_value: float = 0.0  # Per-stone pointer/carat size for rate lookup (col 6)
     weight: float = 0.0       # Total carat weight (col 8)
+    calc_mode: str = "W"      # Q/W flag (col 9): "Q" = priced per piece, "W" = per carat
     price: float = 0.0        # Rate per carat from BOM (col 10)
     value: float = 0.0        # Total value (col 11)
     sub_code: str = ""        # Setting sub-code (col 3, kept for compat)

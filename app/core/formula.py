@@ -74,6 +74,7 @@ VARIABLES: dict[str, VarInfo] = {
     # --- BOM line fields ---
     "weight":      VarInfo("Line weight", "bom", "BOM line — weight (g or ct)"),
     "qty":         VarInfo("Line quantity", "bom", "BOM line — qty"),
+    "basis":       VarInfo("Pricing basis", "bom", "BOM stone line — qty if Q/W='Q', else weight"),
     "lme":         VarInfo("LME / metal Loc rate", "bom", "BOM metal line — LME (US$/troy oz)"),
     "pointer":     VarInfo("Pointer / size", "bom", "BOM stone line — pointer"),
     "line_value":  VarInfo("Template value", "bom", "BOM line — value as quoted"),
@@ -107,7 +108,7 @@ def sample_context() -> dict[str, float]:
     """Representative values for every variable — used to preview/validate a
     formula in the editor without a live BOM. Numbers echo the G14 example."""
     return {
-        "weight": 4.7, "qty": 1.0, "lme": 4875.0, "pointer": 3.10, "line_value": 472.66,
+        "weight": 4.7, "qty": 1.0, "basis": 4.7, "lme": 4875.0, "pointer": 3.10, "line_value": 472.66,
         "setting_rate": 0.40, "setting_qty": 2.0,
         "metal_weight": 4.7, "diamond_weight": 0.774, "colour_weight": 0.0,
         "RmMst_RmPurityRt": 0.5833, "RmRt_CRP": 0.585, "RmRt_rate": 125.0,

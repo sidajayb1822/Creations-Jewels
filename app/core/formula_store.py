@@ -43,13 +43,16 @@ SEED_DEFAULTS: dict[str, FormulaDef] = {
     ),
     "diamond": FormulaDef(
         component="diamond",
-        expression="RmRt_rate * weight",
-        notes="Diamond value = per-carat rate (RmRt range match) × total carat weight.",
+        expression="RmRt_rate * basis",
+        notes="Diamond value = rate × basis — total carat weight when the BOM line is "
+              "weight-priced (Q/W='W'), or qty when it's priced per piece (Q/W='Q', "
+              "common for small melee sold at a flat $/stone).",
     ),
     "colour_stone": FormulaDef(
         component="colour_stone",
-        expression="RmRt_rate * weight",
-        notes="Colour-stone value = per-carat rate × total carat weight.",
+        expression="RmRt_rate * basis",
+        notes="Colour-stone value = rate × basis — total carat weight when the BOM line is "
+              "weight-priced (Q/W='W'), or qty when it's priced per piece (Q/W='Q').",
     ),
     "finding": FormulaDef(
         component="finding",
@@ -83,13 +86,17 @@ SEED_DEFAULTS: dict[str, FormulaDef] = {
     ),
 }
 
-# Old labour seed expressions (pre-minimum). Untouched defaults matching these
-# are upgraded in place on load so existing installs pick up the minimum charge
-# without clobbering any formula the user has customised.
+# Old seed expressions superseded by a later fix. Untouched defaults matching
+# these are upgraded in place on load — e.g. picking up the minimum-charge
+# floor, or (diamond/colour_stone) switching from always-weight to basis
+# (qty for Q/W='Q' stones, weight otherwise) — without clobbering any formula
+# the user has customised.
 _LABOUR_UPGRADES = {
     "labour_q": ("LabRt_rate * qty", "max(LabRt_rate * qty, LabRt_min)"),
     "labour_w": ("LabRt_rate * metal_weight", "max(LabRt_rate * metal_weight, LabRt_min)"),
     "cdw": ("LabRt_rate * diamond_weight", "max(LabRt_rate * diamond_weight, LabRt_min)"),
+    "diamond": ("RmRt_rate * weight", "RmRt_rate * basis"),
+    "colour_stone": ("RmRt_rate * weight", "RmRt_rate * basis"),
 }
 
 
