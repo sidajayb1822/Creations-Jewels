@@ -1,9 +1,10 @@
 from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView,
     QStyledItemDelegate, QStyleOptionViewItem, QStyle,
+    QMenu, QApplication,
 )
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QBrush, QFont, QPen
+from PySide6.QtGui import QColor, QBrush, QFont, QPen, QKeySequence
 
 from app.core.comparator import ComparisonRow
 
@@ -113,6 +114,44 @@ class ComparisonTable(QTableWidget):
 
         self.setSortingEnabled(True)
         self.resizeRowsToContents()
+
+    # ── Copy (right-click menu + Ctrl+C) ────────────────────────────────────
+    def contextMenuEvent(self, event):
+        item = self.itemAt(event.pos())
+        if item is None:
+            return
+        if not item.isSelected():
+            self.selectRow(item.row())
+        menu = QMenu(self)
+        act_cell = menu.addAction("Copy cell")
+        act_rows = menu.addAction("Copy row(s)")
+        act_rows_hdr = menu.addAction("Copy row(s) with headers")
+        chosen = menu.exec(event.globalPos())
+        if chosen is act_cell:
+            QApplication.clipboard().setText(item.text())
+        elif chosen is act_rows:
+            self._copy_rows(with_headers=False)
+        elif chosen is act_rows_hdr:
+            self._copy_rows(with_headers=True)
+
+    def keyPressEvent(self, event):
+        if event.matches(QKeySequence.StandardKey.Copy):
+            self._copy_rows(with_headers=False)
+            return
+        super().keyPressEvent(event)
+
+    def _copy_rows(self, with_headers: bool):
+        """Copy selected rows as tab-separated text (pastes cleanly into Excel)."""
+        rows = sorted({i.row() for i in self.selectedIndexes()})
+        if not rows:
+            return
+        lines = ["\t".join(HEADERS)] if with_headers else []
+        for r in rows:
+            lines.append("\t".join(
+                (self.item(r, c).text() if self.item(r, c) else "")
+                for c in range(self.columnCount())
+            ))
+        QApplication.clipboard().setText("\n".join(lines))
 
     def row_at(self, table_row: int) -> "ComparisonRow | None":
         """Return the ComparisonRow shown at a visual row index (sort-safe)."""
